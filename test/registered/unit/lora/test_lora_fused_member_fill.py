@@ -67,7 +67,10 @@ def test_an_adapter_without_q_is_stacked_not_dropped():
     qkv_b = weights[f"{_STEM}qkv_proj.lora_B.weight"]
     assert qkv_b.shape == (16, _RANK)
     assert qkv_b[:8].eq(0).all() and qkv_b[8:].eq(1).all()
-    assert f"{_STEM}k_proj.lora_B.weight" not in weights and f"{_STEM}v_proj.lora_B.weight" not in weights
+    assert (
+        f"{_STEM}k_proj.lora_B.weight" not in weights
+        and f"{_STEM}v_proj.lora_B.weight" not in weights
+    )
 
 
 def test_an_already_fused_qkv_adapter_is_not_mistaken_for_a_partial_one():
@@ -78,7 +81,10 @@ def test_an_already_fused_qkv_adapter_is_not_mistaken_for_a_partial_one():
     }
     _adapter()._fill_absent_fused_members(0, weights)
 
-    assert sorted(weights) == [f"{_STEM}qkv_proj.lora_A.weight", f"{_STEM}qkv_proj.lora_B.weight"]
+    assert sorted(weights) == [
+        f"{_STEM}qkv_proj.lora_A.weight",
+        f"{_STEM}qkv_proj.lora_B.weight",
+    ]
 
 
 def test_a_q_a_only_mla_adapter_sizes_kv_a_from_the_fused_layer():

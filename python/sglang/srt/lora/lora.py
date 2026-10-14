@@ -240,7 +240,9 @@ class LoRAAdapter(nn.Module):
         "fused_qkv_a_proj_with_mqa": ("q_a_proj", "kv_a_proj_with_mqa"),
     }
 
-    def _fill_absent_fused_members(self, layer_idx: int, weights: Dict[str, torch.Tensor]):
+    def _fill_absent_fused_members(
+        self, layer_idx: int, weights: Dict[str, torch.Tensor]
+    ):
         """Zero-fill the members of a fused q/k/v or MLA q_a/kv_a projection an adapter does not
         train, sized from the base layer, so an adapter may target any subset of the members."""
         for fused, members in self._ZERO_FILLED_FUSED_MEMBERS.items():
@@ -255,22 +257,40 @@ class LoRAAdapter(nn.Module):
                 present = [m for m in members if f"{stem}{m}.lora_A.weight" in weights]
                 if len(present) == len(members):
                     continue
-                rows = {m: weights[f"{stem}{m}.lora_B.weight"].shape[-2] for m in present}
-                _, fused_rows = get_hidden_dim(fused, self.base_hf_config, self.base_model, layer_idx)
+                rows = {
+                    m: weights[f"{stem}{m}.lora_B.weight"].shape[-2] for m in present
+                }
+                _, fused_rows = get_hidden_dim(
+                    fused, self.base_hf_config, self.base_model, layer_idx
+                )
                 exemplar_a = weights[f"{stem}{present[0]}.lora_A.weight"]
                 exemplar_b = weights[f"{stem}{present[0]}.lora_B.weight"]
-                for member, member_rows in self._absent_member_rows(fused, rows, fused_rows).items():
-                    weights[f"{stem}{member}.lora_A.weight"] = torch.zeros_like(exemplar_a)
+                for member, member_rows in self._absent_member_rows(
+                    fused, rows, fused_rows
+                ).items():
+                    weights[f"{stem}{member}.lora_A.weight"] = torch.zeros_like(
+                        exemplar_a
+                    )
                     weights[f"{stem}{member}.lora_B.weight"] = exemplar_b.new_zeros(
                         (*exemplar_b.shape[:-2], member_rows, exemplar_b.shape[-1])
                     )
 
     @staticmethod
-    def _absent_member_rows(fused: str, rows: Dict[str, int], fused_rows: int) -> Dict[str, int]:
+    def _absent_member_rows(
+        fused: str, rows: Dict[str, int], fused_rows: int
+    ) -> Dict[str, int]:
         if fused == "qkv_proj":
             # k and v always share a width; q takes the rest of the fused output
-            kv_rows = rows.get("k_proj") or rows.get("v_proj") or (fused_rows - rows["q_proj"]) // 2
-            widths = {"q_proj": fused_rows - 2 * kv_rows, "k_proj": kv_rows, "v_proj": kv_rows}
+            kv_rows = (
+                rows.get("k_proj")
+                or rows.get("v_proj")
+                or (fused_rows - rows["q_proj"]) // 2
+            )
+            widths = {
+                "q_proj": fused_rows - 2 * kv_rows,
+                "k_proj": kv_rows,
+                "v_proj": kv_rows,
+            }
         else:
             (present,) = rows
             (absent,) = set(LoRAAdapter._ZERO_FILLED_FUSED_MEMBERS[fused]) - {present}
