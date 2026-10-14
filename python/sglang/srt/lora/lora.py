@@ -29,7 +29,7 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.lora_config import LoRAConfig
-from sglang.srt.lora.utils import get_normalized_target_modules
+from sglang.srt.lora.utils import get_hidden_dim, get_normalized_target_modules
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
@@ -216,7 +216,8 @@ class LoRAAdapter(nn.Module):
             )
 
     def _normalize_weights(self):
-        for layer in self.layers:
+        for layer_idx, layer in enumerate(self.layers):
+            self._fill_absent_fused_members(layer_idx, layer.weights)
             weight_names = list(layer.weights.keys())
             self.normalize_qkv_proj(weight_names, layer.weights)
             self.normalize_inkling_qkvr_proj(weight_names, layer.weights)
@@ -232,6 +233,49 @@ class LoRAAdapter(nn.Module):
             self.normalize_gate_up_proj(weight_names, layer.weights)
             weight_names = list(layer.weights.keys())
             self.normalize_fused_qkv_a_proj(weight_names, layer.weights)
+
+    # fused module -> its members, in buffer order
+    _ZERO_FILLED_FUSED_MEMBERS = {
+        "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+        "fused_qkv_a_proj_with_mqa": ("q_a_proj", "kv_a_proj_with_mqa"),
+    }
+
+    def _fill_absent_fused_members(self, layer_idx: int, weights: Dict[str, torch.Tensor]):
+        """Zero-fill the members of a fused q/k/v or MLA q_a/kv_a projection an adapter does not
+        train, sized from the base layer, so an adapter may target any subset of the members."""
+        for fused, members in self._ZERO_FILLED_FUSED_MEMBERS.items():
+            # the dot keeps "qkv_proj" from matching member "v_proj"
+            stems = {
+                name.removesuffix(f"{member}.lora_A.weight")
+                for name in weights
+                for member in members
+                if name.endswith(f".{member}.lora_A.weight")
+            }
+            for stem in stems:
+                present = [m for m in members if f"{stem}{m}.lora_A.weight" in weights]
+                if len(present) == len(members):
+                    continue
+                rows = {m: weights[f"{stem}{m}.lora_B.weight"].shape[-2] for m in present}
+                _, fused_rows = get_hidden_dim(fused, self.base_hf_config, self.base_model, layer_idx)
+                exemplar_a = weights[f"{stem}{present[0]}.lora_A.weight"]
+                exemplar_b = weights[f"{stem}{present[0]}.lora_B.weight"]
+                for member, member_rows in self._absent_member_rows(fused, rows, fused_rows).items():
+                    weights[f"{stem}{member}.lora_A.weight"] = torch.zeros_like(exemplar_a)
+                    weights[f"{stem}{member}.lora_B.weight"] = exemplar_b.new_zeros(
+                        (*exemplar_b.shape[:-2], member_rows, exemplar_b.shape[-1])
+                    )
+
+    @staticmethod
+    def _absent_member_rows(fused: str, rows: Dict[str, int], fused_rows: int) -> Dict[str, int]:
+        if fused == "qkv_proj":
+            # k and v always share a width; q takes the rest of the fused output
+            kv_rows = rows.get("k_proj") or rows.get("v_proj") or (fused_rows - rows["q_proj"]) // 2
+            widths = {"q_proj": fused_rows - 2 * kv_rows, "k_proj": kv_rows, "v_proj": kv_rows}
+        else:
+            (present,) = rows
+            (absent,) = set(LoRAAdapter._ZERO_FILLED_FUSED_MEMBERS[fused]) - {present}
+            widths = {present: rows[present], absent: fused_rows - rows[present]}
+        return {member: width for member, width in widths.items() if member not in rows}
 
     def normalize_inkling_qkvr_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
@@ -282,45 +326,19 @@ class LoRAAdapter(nn.Module):
     def normalize_qkv_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
     ):
-        # Collect target q/k/v modules. This process is necessary since there might be no lora attached to k_proj
-        target_module = set()
         for weight_name in weight_names:
-            if "k_proj" in weight_name:
-                target_module.add("k_proj")
-            if "q_proj" in weight_name:
-                target_module.add("q_proj")
-            if "v_proj" in weight_name:
-                target_module.add("v_proj")
-            if "qkv_proj" in weight_name:
-                target_module.add("qkv_proj")
-        if len(target_module) == 0:
-            return
-
-        for weight_name in weight_names:
-            # We assume every lora adaptor should contain lora modules for q_proj
+            # _fill_absent_fused_members put k and v next to every q
             if "q_proj" in weight_name:
                 q_name = weight_name
                 k_name = weight_name.replace("q_proj", "k_proj")
                 v_name = weight_name.replace("q_proj", "v_proj")
                 qkv_name = weight_name.replace("q_proj", "qkv_proj")
 
-                # If k_proj doesn't have lora, initialize it to zero
-                k_proj_weight = (
-                    weights[k_name]
-                    if "k_proj" in target_module
-                    else torch.zeros_like(weights[v_name])
-                )
                 weights[qkv_name] = torch.cat(
-                    (
-                        weights[q_name],
-                        k_proj_weight,
-                        weights[v_name],
-                    ),
-                    0,
+                    (weights[q_name], weights[k_name], weights[v_name]), 0
                 )
                 weights.pop(q_name)
-                if "k_proj" in target_module:
-                    weights.pop(k_name)
+                weights.pop(k_name)
                 weights.pop(v_name)
             elif "qkv_proj" in weight_name:
                 # If qkv_proj is already stacked, we normalize it following the SGL convention.
@@ -592,16 +610,11 @@ class LoRAAdapter(nn.Module):
             kv_a_name = weight_name.replace("q_a_proj", "kv_a_proj_with_mqa")
             fused_name = weight_name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
 
-            kv_a_weight = (
-                weights[kv_a_name]
-                if kv_a_name in weights
-                else torch.zeros_like(weights[q_a_name])
+            weights[fused_name] = torch.cat(
+                (weights[q_a_name], weights[kv_a_name]), dim=0
             )
-
-            weights[fused_name] = torch.cat((weights[q_a_name], kv_a_weight), dim=0)
             weights.pop(q_a_name)
-            if kv_a_name in weights:
-                weights.pop(kv_a_name)
+            weights.pop(kv_a_name)
 
     def pin_weights_in_cpu(self):
         for layer in self.layers:
