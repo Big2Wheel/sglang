@@ -7,7 +7,7 @@ group creation remains the responsibility of the runner.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from enum import Enum, auto
@@ -34,6 +34,8 @@ from sglang.srt.layers.dp_attention import (
     welm_reconstruct_attn_scattered_residual_rows,
 )
 from sglang.srt.layers.welmv4_op import mmq_style_norm_after_attn
+from sglang.srt.state_capturer.routed_experts import local_dp_route_slot
+from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.distributed import GroupCoordinator
@@ -1464,25 +1466,39 @@ class WelmDpAttentionExecutor:
         use_local_ep = (
             transport is WelmMoeTransport.EXPLICIT_AG_LOCAL_SORT_EP_AR
         )
-        mlp_output = layer.mlp(
-            full_hidden,
-            None,
-            forward_batch,
-            False,
-            return_components=False,
-            use_welm_local_ep_moe=use_local_ep,
-            valid_row_mask=valid_mask,
-            invalid_row_mask=invalid_mask,
-            invalid_topk_id=-1 if use_local_ep else 0,
-            allow_inplace_expert_shared_merge=True,
-            resolved_moe_tp_group=(
-                None if use_local_ep else plan.moe_tp_group
-            ),
-            resolved_moe_ep_group=(
-                plan.moe_ep_group if use_local_ep else None
-            ),
-            use_welm_decode_like_stream_policy=use_local_ep,
+        route_context = (
+            local_dp_route_slot(
+                int(active_view.slot_offsets_cpu[plan.outer_target_dp_rank]),
+                int(active_view.local_slot_rows),
+            )
+            if (
+                use_local_ep
+                and plan.role is WelmRunnerRole.TARGET_DP
+                and plan.attn_tp_size == 1
+                and get_bool_env_var("WELM_LOCAL_EP_ROUTE_AUDIT")
+            )
+            else nullcontext()
         )
+        with route_context:
+            mlp_output = layer.mlp(
+                full_hidden,
+                None,
+                forward_batch,
+                False,
+                return_components=False,
+                use_welm_local_ep_moe=use_local_ep,
+                valid_row_mask=valid_mask,
+                invalid_row_mask=invalid_mask,
+                invalid_topk_id=-1 if use_local_ep else 0,
+                allow_inplace_expert_shared_merge=True,
+                resolved_moe_tp_group=(
+                    None if use_local_ep else plan.moe_tp_group
+                ),
+                resolved_moe_ep_group=(
+                    plan.moe_ep_group if use_local_ep else None
+                ),
+                use_welm_decode_like_stream_policy=use_local_ep,
+            )
         full_hidden = self._store_final_components(layer, mlp_output)
         full_hidden.masked_fill_(invalid_mask[:, None], 0)
         local_hidden_slot = welm_dp_local_slot_slice(

@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Optional
 
 import numpy as np
@@ -19,6 +21,19 @@ from sglang.srt.runtime_context import (
     get_server_args,
 )
 from sglang.srt.state_capturer.base import BaseTopkCapturer
+
+
+_LOCAL_DP_ROUTE_SLOT = ContextVar("local_dp_route_slot", default=None)
+
+
+@contextmanager
+def local_dp_route_slot(start: int, rows: int):
+    """Identify this rank's rows when MoE runs on globally replicated slots."""
+    previous = _LOCAL_DP_ROUTE_SLOT.set((start, rows))
+    try:
+        yield
+    finally:
+        _LOCAL_DP_ROUTE_SLOT.reset(previous)
 
 
 class RoutedExpertsCapturer(BaseTopkCapturer):
@@ -107,6 +122,8 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             )
 
     def capture(self, layer_id: int, topk_indices: torch.Tensor):
+        if (slot := _LOCAL_DP_ROUTE_SLOT.get()) is not None:
+            topk_indices = topk_indices.narrow(0, *slot)
         if get_moe_a2a_backend().is_deepep():
             local_topk = topk_indices
             topk_indices = self.gather_buffer[

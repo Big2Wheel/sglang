@@ -144,6 +144,10 @@ class ForwardMetadata:
     # Read-only schedules shared by equal attention geometries in this forward.
     # Each graph bucket owns its capture outputs; never share across forwards.
     welm_flash_schedules: dict[tuple, torch.Tensor] = field(default_factory=dict)
+    # Full MK Decode takes these AiCPU-produced schedules as fixed graph inputs.
+    # None preserves normal Eager and ACLGraph behavior.
+    welm_mk_schedule_recipes: Optional[dict] = None
+    welm_mk_schedule_bootstrap: bool = False
     # Ordinary prefill consumers use one Q per request, unlike source layers.
     welm_flash_mirror_q_lengths: Optional[tuple[torch.Tensor, torch.Tensor]] = None
 
@@ -548,6 +552,7 @@ class AscendAttnBackend(AttentionBackend):
         sinks: Optional[torch.Tensor],
         *,
         mirror_prefill: bool = False,
+        mk_decode: bool = False,
     ) -> torch.Tensor:
         """Paged Full/SWA attention with native FP32 sinks, eager or graph.
 
@@ -625,6 +630,9 @@ class AscendAttnBackend(AttentionBackend):
         )
         schedule = metadata.welm_flash_schedules.get(schedule_key)
         if schedule is None:
+            recipes = metadata.welm_mk_schedule_recipes
+            if recipes is not None and not metadata.welm_mk_schedule_bootstrap:
+                raise RuntimeError("MegaKernel Decode needs a prepared FlashAttn schedule")
             schedule = self._welm_flash_attn_metadata(
                 layer.tp_q_head_num,
                 layer.tp_k_head_num,
@@ -632,18 +640,29 @@ class AscendAttnBackend(AttentionBackend):
                 **common,
             )
             metadata.welm_flash_schedules[schedule_key] = schedule
-        output, _ = self._welm_flash_attn(
-            query,
-            key,
-            value,
+            if recipes is not None:
+                recipes[schedule_key] = (schedule_key[1:4], common)
+        launch_kwargs = dict(
             block_table=block_table,
             sinks=sinks.float() if sinks is not None else None,
             attn_mask=self.welm_flash_attn_mask,
             metadata=schedule,
             softmax_scale=layer.scaling,
             return_softmax_lse=False,
-            **common,
         )
+        if mk_decode:
+            from sglang.srt.hardware_backend.npu.attention.welm_mk_flash import WelmMKFlash
+
+            if not hasattr(self, "_welm_mk_flash"):
+                self._welm_mk_flash = WelmMKFlash()
+            output = self._welm_mk_flash.forward(
+                self._welm_flash_attn, query, key, value,
+                layer_id=layer.layer_id, common=common,
+                table_width=(self.max_context_len + self.page_size - 1) // self.page_size,
+                **launch_kwargs,
+            )
+        else:
+            output, _ = self._welm_flash_attn(query, key, value, **launch_kwargs, **common)
         if num_tokens != padded_tokens:
             output = torch.cat(
                 [
@@ -1287,8 +1306,12 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_welm_flash_attn:
             # run_once invokes this for each warmup AND the actual capture.
             # Capture must record fresh producers, not reuse warmup schedules.
-            self.forward_metadata.welm_flash_schedules.clear()
-            self.forward_metadata.welm_flash_mirror_q_lengths = None
+            metadata = self.forward_metadata
+            if (
+                metadata.welm_mk_schedule_recipes is None
+                or metadata.welm_mk_schedule_bootstrap
+            ):
+                metadata.welm_flash_schedules.clear()
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -1629,16 +1652,6 @@ class AscendAttnBackend(AttentionBackend):
         """
         metadata = self.graph_metadata[bs]
 
-        # Keep a copy of the pre-normalized lengths. TARGET_VERIFY below adds
-        # D to the live KV lengths, so this mask must be formed first. Capture
-        # buckets place real requests first and zero-fill padding requests.
-        welm_mtp_real_rows = None
-        if self.is_welm_v4 and (
-            forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
-        ):
-            welm_mtp_real_rows = seq_lens[:bs] > 0
-        flash_real_rows = seq_lens[:bs] > 0 if self.use_welm_flash_attn else None
-
         # refill the captured SWA write-target buffer in place from the live loc
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             n = out_cache_loc.shape[0]
@@ -1656,6 +1669,33 @@ class AscendAttnBackend(AttentionBackend):
         ):
             max_len += self.speculative_step_id + 1
         max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+
+        if (
+            self.is_welm_v4 and self.use_welm_flash_attn and self.is_hybrid_swa
+            and forward_mode.is_target_verify() and not _is_dflash_verify(spec_info)
+            and metadata.full_sink_prefill_cu_q_lens is None
+            and get_bool_env_var("WELM_STAGE7_FUSED_VERIFY_METADATA")
+        ):
+            from sglang.srt.hardware_backend.npu.attention.welm_verify_metadata import (
+                prepare_verify_metadata,
+            )
+
+            prepare_verify_metadata(
+                metadata, self.req_to_token, req_pool_indices, seq_lens,
+                self.full_to_swa_index_mapping, bs, max_seq_pages, self.page_size,
+                self.speculative_num_draft_tokens,
+            )
+            self.forward_metadata = metadata
+            self.graph_mode = True
+            return
+
+        # Form this mask before TARGET_VERIFY adds D to the live lengths.
+        welm_mtp_real_rows = None
+        if self.is_welm_v4 and (
+            forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
+        ):
+            welm_mtp_real_rows = seq_lens[:bs] > 0
+        flash_real_rows = seq_lens[:bs] > 0 if self.use_welm_flash_attn else None
 
         if self.is_hybrid_swa:
             metadata.block_tables_swa[:bs, :max_seq_pages].copy_(
@@ -3863,7 +3903,11 @@ class AscendAttnBackend(AttentionBackend):
 
             if self.use_welm_flash_attn:
                 return self._forward_welm_flash_attention(
-                    q, k_cache, v_cache, layer, sinks
+                    q, k_cache, v_cache, layer, sinks,
+                    mk_decode=(
+                        forward_batch.forward_mode.is_decode()
+                        and get_bool_env_var("WELM_NPU_USE_MK_FLASH_DECODE", "False")
+                    ),
                 )
 
             if sinks is not None or (

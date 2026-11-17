@@ -9,6 +9,7 @@ from torch import nn
 
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding
 from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.layers.welmv4_mk_triton import target_native
 from sglang.srt.utils import is_npu
 
 if is_npu():
@@ -291,8 +292,8 @@ def _do_mmq_rms_norm(hidden, gamma, cols: int, eps: tl.constexpr):
     return out, inv_rms
 
 
-@triton.jit(do_not_specialize=["rows"])
-def mmq_style_norm_after_attn_kernel(
+@triton.jit
+def _mmq_style_norm_after_attn_tiles(
     hidden_states_ptr: tl.tensor,
     residual_ptr: tl.tensor,
     onorm_gamma_ptr: tl.tensor,
@@ -305,6 +306,8 @@ def mmq_style_norm_after_attn_kernel(
     eps: float,
     BLOCK_SIZE: tl.constexpr,  # pylint: disable=invalid-name
     WRITE_FP32_OUT: tl.constexpr,  # pylint: disable=invalid-name
+    tile_id,
+    tile_count,
 ):
     cols_offsets = tl.arange(0, BLOCK_SIZE)
     mask = cols_offsets < cols
@@ -313,7 +316,7 @@ def mmq_style_norm_after_attn_kernel(
     output_dtype = output_ptr.dtype.element_ty
 
     for row_id in tl.range(
-        tl.program_id(0), rows, tl.num_programs(0), num_stages=2
+        tile_id, rows, tile_count, num_stages=2
     ):
         offsets = (row_id * cols + cols_offsets).to(tl.int64)
         hs = tl.load(hidden_states_ptr + offsets, mask=mask, other=0.0)
@@ -328,6 +331,33 @@ def mmq_style_norm_after_attn_kernel(
         if WRITE_FP32_OUT:
             tl.store(fp32_out_ptr + offsets, rnorm_out, mask=mask)
         tl.store(output_ptr + offsets, rnorm_out.to(output_dtype), mask=mask)
+
+
+@triton.jit(do_not_specialize=["rows", "tile_id", "tile_count"])
+def _mmq_style_norm_after_attn_child(
+    hidden_states_ptr, residual_ptr, onorm_gamma_ptr, rnorm_gamma_ptr,
+    output_ptr, residual_out_ptr, fp32_out_ptr, rows, cols: tl.constexpr,
+    eps, BLOCK_SIZE: tl.constexpr, WRITE_FP32_OUT: tl.constexpr, tile_id, tile_count,
+):
+    _mmq_style_norm_after_attn_tiles(
+        hidden_states_ptr, residual_ptr, onorm_gamma_ptr, rnorm_gamma_ptr, output_ptr,
+        residual_out_ptr, fp32_out_ptr, rows, cols, eps, BLOCK_SIZE, WRITE_FP32_OUT,
+        tile_id, tile_count,
+    )
+
+
+@target_native(_mmq_style_norm_after_attn_child)
+@triton.jit(do_not_specialize=["rows"])
+def mmq_style_norm_after_attn_kernel(
+    hidden_states_ptr, residual_ptr, onorm_gamma_ptr, rnorm_gamma_ptr,
+    output_ptr, residual_out_ptr, fp32_out_ptr, rows, cols: tl.constexpr,
+    eps, BLOCK_SIZE: tl.constexpr, WRITE_FP32_OUT: tl.constexpr,
+):
+    _mmq_style_norm_after_attn_tiles(
+        hidden_states_ptr, residual_ptr, onorm_gamma_ptr, rnorm_gamma_ptr, output_ptr,
+        residual_out_ptr, fp32_out_ptr, rows, cols, eps, BLOCK_SIZE, WRITE_FP32_OUT,
+        tl.program_id(0), tl.num_programs(0),
+    )
 
 
 def mmq_style_norm_after_attn(
@@ -376,14 +406,8 @@ def mmq_style_norm_after_attn(
     return output, residual_out, fp32_out
 
 
-@triton.jit(
-    do_not_specialize=[
-        "rows",
-        "hidden_states_num_kv",
-        "hidden_states_kv_stride",
-    ]
-)
-def rms_norm_kernel(  # pylint: disable=too-many-arguments,too-many-locals
+@triton.jit
+def _rms_norm_tiles(  # pylint: disable=too-many-arguments,too-many-locals
     hidden_states_ptr: tl.tensor,
     reisdual_ptr: tl.tensor,
     gamma_ptr: tl.tensor,
@@ -399,15 +423,16 @@ def rms_norm_kernel(  # pylint: disable=too-many-arguments,too-many-locals
     residual_row_stride: int,
     residual_after_layernorm: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,  # pylint: disable=invalid-name
+    tile_id,
+    tile_count,
 ):
-    row_start = tl.program_id(0)
     cols_off = tl.arange(0, BLOCK_SIZE)
     mask = cols_off < cols
     gamma_shm = tl.load(gamma_ptr + cols_off, mask=mask, other=0.0)
 
     output_dtype = out_ptr.dtype.element_ty
     for row_id in tl.range(
-        row_start, rows, tl.num_programs(0), num_stages=2
+        tile_id, rows, tile_count, num_stages=2
     ):
         kv_idx = row_id // hidden_states_num_kv
         row_idx = row_id % hidden_states_num_kv
@@ -437,6 +462,37 @@ def rms_norm_kernel(  # pylint: disable=too-many-arguments,too-many-locals
             tl.store(out_residual_ptr + output_offs, out, mask=mask)
 
         tl.store(out_ptr + output_offs, out, mask=mask)
+
+
+@triton.jit(do_not_specialize=[
+    "rows", "hidden_states_num_kv", "hidden_states_kv_stride", "tile_id", "tile_count",
+])
+def _rms_norm_child(
+    hidden_states_ptr, reisdual_ptr, gamma_ptr, out_ptr, out_residual_ptr, out_copy_ptr,
+    rows, cols: tl.constexpr, eps, hidden_states_row_stride, hidden_states_num_kv,
+    hidden_states_kv_stride, residual_row_stride, residual_after_layernorm: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr, tile_id, tile_count,
+):
+    _rms_norm_tiles(
+        hidden_states_ptr, reisdual_ptr, gamma_ptr, out_ptr, out_residual_ptr, out_copy_ptr,
+        rows, cols, eps, hidden_states_row_stride, hidden_states_num_kv, hidden_states_kv_stride,
+        residual_row_stride, residual_after_layernorm, BLOCK_SIZE, tile_id, tile_count,
+    )
+
+
+@target_native(_rms_norm_child)
+@triton.jit(do_not_specialize=["rows", "hidden_states_num_kv", "hidden_states_kv_stride"])
+def rms_norm_kernel(
+    hidden_states_ptr, reisdual_ptr, gamma_ptr, out_ptr, out_residual_ptr, out_copy_ptr,
+    rows, cols: tl.constexpr, eps, hidden_states_row_stride, hidden_states_num_kv,
+    hidden_states_kv_stride, residual_row_stride, residual_after_layernorm: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    _rms_norm_tiles(
+        hidden_states_ptr, reisdual_ptr, gamma_ptr, out_ptr, out_residual_ptr, out_copy_ptr,
+        rows, cols, eps, hidden_states_row_stride, hidden_states_num_kv, hidden_states_kv_stride,
+        residual_row_stride, residual_after_layernorm, BLOCK_SIZE, tl.program_id(0), tl.num_programs(0),
+    )
 
 
 class WelmV4FusedRMSNorm(MultiPlatformOp):
@@ -672,8 +728,8 @@ def mmq_style_shared_experts_add_residual_rms_norm(
     return output
 
 
-@triton.jit(do_not_specialize=["tokens"])
-def mmq_style_k_rms_norm_kernel(
+@triton.jit
+def _mmq_style_k_rms_norm_tiles(
     x_ptr: tl.tensor,
     gamma_ptr: tl.tensor,
     out_ptr: tl.tensor,
@@ -684,6 +740,8 @@ def mmq_style_k_rms_norm_kernel(
     out_token_stride: int,
     eps: float,
     KV_HEADS_BLOCK: tl.constexpr,  # pylint: disable=invalid-name
+    tile_id,
+    tile_count,
 ):
     head_dim_offs = tl.arange(0, head_dim)
     kv_head_offs = tl.arange(0, KV_HEADS_BLOCK)
@@ -691,7 +749,7 @@ def mmq_style_k_rms_norm_kernel(
     gamma = tl.load(gamma_ptr + head_dim_offs)
 
     for token_id in tl.range(
-        tl.program_id(0), tokens, tl.num_programs(0), num_stages=4
+        tile_id, tokens, tile_count, num_stages=4
     ):
         in_offs = token_id * x_token_stride.to(tl.int64) + block_offs
         x = tl.load(
@@ -703,6 +761,31 @@ def mmq_style_k_rms_norm_kernel(
 
         out_offs = token_id * out_token_stride.to(tl.int64) + block_offs
         tl.store(out_ptr + out_offs, out, mask=kv_head_offs[:, None] < kv_heads)
+
+
+@triton.jit(do_not_specialize=["tokens", "tile_id", "tile_count"])
+def _mmq_style_k_rms_norm_child(
+    x_ptr, gamma_ptr, out_ptr, tokens, kv_heads: tl.constexpr,
+    head_dim: tl.constexpr, x_token_stride, out_token_stride, eps,
+    KV_HEADS_BLOCK: tl.constexpr, tile_id, tile_count,
+):
+    _mmq_style_k_rms_norm_tiles(
+        x_ptr, gamma_ptr, out_ptr, tokens, kv_heads, head_dim, x_token_stride,
+        out_token_stride, eps, KV_HEADS_BLOCK, tile_id, tile_count,
+    )
+
+
+@target_native(_mmq_style_k_rms_norm_child)
+@triton.jit(do_not_specialize=["tokens"])
+def mmq_style_k_rms_norm_kernel(
+    x_ptr: tl.tensor, gamma_ptr: tl.tensor, out_ptr: tl.tensor, tokens: int,
+    kv_heads: tl.constexpr, head_dim: tl.constexpr, x_token_stride: int,
+    out_token_stride: int, eps: float, KV_HEADS_BLOCK: tl.constexpr,
+):
+    _mmq_style_k_rms_norm_tiles(
+        x_ptr, gamma_ptr, out_ptr, tokens, kv_heads, head_dim, x_token_stride,
+        out_token_stride, eps, KV_HEADS_BLOCK, tl.program_id(0), tl.num_programs(0),
+    )
 
 
 def mmq_style_k_rms_norm(

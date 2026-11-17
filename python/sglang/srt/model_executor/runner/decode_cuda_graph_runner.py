@@ -639,12 +639,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else True
         )
 
-        return (
+        supported = (
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and is_ngram_supported
         )
+        report_ineligible = getattr(self.backend, "report_ineligible", None)
+        if not supported and report_ineligible is not None:
+            report_ineligible(forward_batch, graph_key)
+        return supported
 
     def _can_run_ragged_verify_graph(self, forward_batch: ForwardBatch, ragged_layout):
         if not self.attn_backend.supports_ragged_verify_graph:

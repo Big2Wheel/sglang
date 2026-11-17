@@ -22,6 +22,7 @@ live in :mod:`.cuda_graph_config`.
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 from sglang.srt.model_executor.cuda_graph_config import Backend
@@ -64,6 +65,15 @@ def resolve_decode_backend(
     enable_memory_saver = model_runner.server_args.enable_memory_saver
 
     if model_runner.device == "npu":
+        if (
+            os.environ.get("WELM_NPU_USE_MK_TARGET_DECODE") == "1"
+            and not model_runner.is_draft_worker
+        ):
+            from sglang.srt.hardware_backend.npu.graph_runner.welm_mk_decode_backend import (
+                WelmMKDecodeBackend,
+            )
+
+            return WelmMKDecodeBackend(cuda_graph_runner)
         from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
             NPUCudaGraphBackend,
         )

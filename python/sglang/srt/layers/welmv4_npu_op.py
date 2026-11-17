@@ -456,12 +456,11 @@ def _rope_npu(
     base = data_ptr + num_head_offset[:, None] * head_dim
     # 分两半加载: 前半 x1 与后半 x2,每半沿 rope 维度连续
     x1 = tl.load(
-        base + half_rope_offset[None, :], mask=mask, care_padding=False
+        base + half_rope_offset[None, :], mask=mask
     )
     x2 = tl.load(
         base + (half_rope_dim + half_rope_offset)[None, :],
         mask=mask,
-        care_padding=False,
     )
     # GPT-NeoX rotate-half
     x_out1 = x1 * cos - x2 * sin
@@ -495,7 +494,6 @@ def _welmv4_inplace_rope_kernel_npu(
     """WeLMv4 尾部 RoPE 主 kernel (就地修改 Q/K)。
 
     与原始 kernel 的差异:
-      - 所有 tl.load 添加 care_padding=False
       - 调用的 _rope_npu 已重写 (消除 trans/split/join, 分半 load/store)
     Grid (1D, 跨步循环)、计算逻辑、条件分支均保持不变。
     """
@@ -506,12 +504,11 @@ def _welmv4_inplace_rope_kernel_npu(
         tl.program_id(0), N, tl.num_programs(0), num_stages=num_stages
     ):
         position_id = tl.load(position_ptr + token_id).to(tl.int32)
-        # [NPU 迁移] 添加 care_padding=False
         cos_sin_cache = tl.load(
-            cos_sin_cache_ptr + position_id * rope_dim + cos_off, care_padding=False
+            cos_sin_cache_ptr + position_id * rope_dim + cos_off
         )
         sin_sin_cache = tl.load(
-            cos_sin_cache_ptr + position_id * rope_dim + sin_off, care_padding=False
+            cos_sin_cache_ptr + position_id * rope_dim + sin_off
         )
         q_data_ptr = q_ptr + token_id * q_token_stride + head_dim - rope_dim
         k_data_ptr = k_ptr + token_id * k_token_stride + head_dim - rope_dim
@@ -523,14 +520,11 @@ def _welmv4_inplace_rope_kernel_npu(
             if token_id < BS:
                 position_id = tl.load(last_index_ptr + token_id).to(tl.int32)
                 position_id = tl.load(position_ptr + position_id).to(tl.int32)
-                # [NPU 迁移] 添加 care_padding=False
                 cos_sin_cache = tl.load(
                     cos_sin_cache_ptr + position_id * rope_dim + cos_off,
-                    care_padding=False,
                 )
                 sin_sin_cache = tl.load(
                     cos_sin_cache_ptr + position_id * rope_dim + sin_off,
-                    care_padding=False,
                 )
                 _rope_npu(
                     q_data_ptr, cos_sin_cache, sin_sin_cache,
@@ -564,19 +558,16 @@ def _welmv4_apply_token_block_rope_npu(
             base + rope_offsets[None, :],
             mask=mask,
             other=0.0,
-            care_padding=False,
         )
         x2 = tl.load(
             base + half_rope_dim + rope_offsets[None, :],
             mask=mask,
             other=0.0,
-            care_padding=False,
         )
     else:
-        x1 = tl.load(base + rope_offsets[None, :], care_padding=False)
+        x1 = tl.load(base + rope_offsets[None, :])
         x2 = tl.load(
             base + half_rope_dim + rope_offsets[None, :],
-            care_padding=False,
         )
     out1 = x1 * cos - x2 * sin
     out2 = x1 * sin + x2 * cos
@@ -609,10 +600,9 @@ def _welmv4_apply_token_head_block_rope_npu(
         + token_offsets[:, None, None] * token_stride
         + head_offsets[None, :, None] * head_dim
     )
-    x1 = tl.load(base + rope_offsets[None, None, :], care_padding=False)
+    x1 = tl.load(base + rope_offsets[None, None, :])
     x2 = tl.load(
         base + half_rope_dim + rope_offsets[None, None, :],
-        care_padding=False,
     )
     cos = cos[:, None, :]
     sin = sin[:, None, :]
@@ -648,13 +638,11 @@ def _welmv4_apply_masked_token_head_block_rope_npu(
         base + rope_offsets[None, None, :],
         mask=mask,
         other=0.0,
-        care_padding=False,
     )
     x2 = tl.load(
         base + half_rope_dim + rope_offsets[None, None, :],
         mask=mask,
         other=0.0,
-        care_padding=False,
     )
     cos = cos[:, None, :]
     sin = sin[:, None, :]
@@ -711,7 +699,6 @@ def _welmv4_inplace_rope_prefill_kernel_npu(
                 + cos_offsets[None, :],
                 mask=token_mask[:, None],
                 other=0.0,
-                care_padding=False,
             )
             sin = tl.load(
                 cos_sin_cache_ptr
@@ -719,7 +706,6 @@ def _welmv4_inplace_rope_prefill_kernel_npu(
                 + sin_offsets[None, :],
                 mask=token_mask[:, None],
                 other=0.0,
-                care_padding=False,
             )
         else:
             position_ids = tl.load(
@@ -729,13 +715,11 @@ def _welmv4_inplace_rope_prefill_kernel_npu(
                 cos_sin_cache_ptr
                 + position_ids[:, None] * rope_dim
                 + cos_offsets[None, :],
-                care_padding=False,
             )
             sin = tl.load(
                 cos_sin_cache_ptr
                 + position_ids[:, None] * rope_dim
                 + sin_offsets[None, :],
-                care_padding=False,
             )
             # Runtime position rows are genuinely discrete on the generic
             # path.  Avoid the backend's scalarized per-row GM copies.
@@ -865,7 +849,6 @@ def _welmv4_inplace_rope_contiguous_prefill_kernel_npu(
                 + cos_offsets[None, :],
                 mask=token_mask[:, None],
                 other=0.0,
-                care_padding=False,
             )
             sin = tl.load(
                 cos_sin_cache_ptr
@@ -873,20 +856,17 @@ def _welmv4_inplace_rope_contiguous_prefill_kernel_npu(
                 + sin_offsets[None, :],
                 mask=token_mask[:, None],
                 other=0.0,
-                care_padding=False,
             )
         else:
             cos = tl.load(
                 cos_sin_cache_ptr
                 + position_ids[:, None] * rope_dim
                 + cos_offsets[None, :],
-                care_padding=False,
             )
             sin = tl.load(
                 cos_sin_cache_ptr
                 + position_ids[:, None] * rope_dim
                 + sin_offsets[None, :],
-                care_padding=False,
             )
 
         k_data = k_ptr + token_base * k_token_stride + head_dim - rope_dim
@@ -1018,7 +998,6 @@ def _welmv4_inplace_rope_segmented_prefill_kernel_npu(
             + cos_offsets[None, :],
             mask=token_mask[:, None],
             other=0.0,
-            care_padding=False,
         )
         sin = tl.load(
             cos_sin_cache_ptr
@@ -1026,7 +1005,6 @@ def _welmv4_inplace_rope_segmented_prefill_kernel_npu(
             + sin_offsets[None, :],
             mask=token_mask[:, None],
             other=0.0,
-            care_padding=False,
         )
 
         k_data = k_ptr + token_base * k_token_stride + head_dim - rope_dim
@@ -1112,11 +1090,9 @@ def _welmv4_inplace_rope_contiguous_mirror_kernel_npu(
         q_position = tl.load(position_ptr + q_source_token).to(tl.int32)
         q_cos = tl.load(
             cos_sin_cache_ptr + q_position * rope_dim + cos_offsets,
-            care_padding=False,
         )
         q_sin = tl.load(
             cos_sin_cache_ptr + q_position * rope_dim + sin_offsets,
-            care_padding=False,
         )
         q_data = q_ptr + head_dim - rope_dim
         if num_q_heads == 6:
@@ -1158,13 +1134,11 @@ def _welmv4_inplace_rope_contiguous_mirror_kernel_npu(
                 cos_sin_cache_ptr
                 + position_ids[:, None] * rope_dim
                 + cos_offsets[None, :],
-                care_padding=False,
             )
             sin = tl.load(
                 cos_sin_cache_ptr
                 + position_ids[:, None] * rope_dim
                 + sin_offsets[None, :],
-                care_padding=False,
             )
             if num_k_heads == 1:
                 _welmv4_apply_token_block_rope_npu(
@@ -1192,7 +1166,6 @@ def _welmv4_inplace_rope_contiguous_mirror_kernel_npu(
                 + cos_offsets[None, :],
                 mask=token_mask[:, None],
                 other=0.0,
-                care_padding=False,
             )
             sin = tl.load(
                 cos_sin_cache_ptr
@@ -1200,7 +1173,6 @@ def _welmv4_inplace_rope_contiguous_mirror_kernel_npu(
                 + sin_offsets[None, :],
                 mask=token_mask[:, None],
                 other=0.0,
-                care_padding=False,
             )
             if num_k_heads == 1:
                 _welmv4_apply_token_block_rope_npu(
@@ -1260,11 +1232,9 @@ def _welmv4_inplace_rope_segmented_mirror_kernel_npu(
         q_position = tl.load(position_ptr + q_source_token).to(tl.int32)
         q_cos = tl.load(
             cos_sin_cache_ptr + q_position * rope_dim + cos_offsets,
-            care_padding=False,
         )
         q_sin = tl.load(
             cos_sin_cache_ptr + q_position * rope_dim + sin_offsets,
-            care_padding=False,
         )
         q_data = q_ptr + request_id * q_token_stride + head_dim - rope_dim
         if num_q_heads == 6:
@@ -1308,13 +1278,11 @@ def _welmv4_inplace_rope_segmented_mirror_kernel_npu(
                 cos_sin_cache_ptr
                 + position_ids[:, None] * rope_dim
                 + cos_offsets[None, :],
-                care_padding=False,
             )
             sin = tl.load(
                 cos_sin_cache_ptr
                 + position_ids[:, None] * rope_dim
                 + sin_offsets[None, :],
-                care_padding=False,
             )
             if num_k_heads == 1:
                 _welmv4_apply_token_block_rope_npu(
@@ -1344,7 +1312,6 @@ def _welmv4_inplace_rope_segmented_mirror_kernel_npu(
                 + cos_offsets[None, :],
                 mask=token_mask[:, None],
                 other=0.0,
-                care_padding=False,
             )
             sin = tl.load(
                 cos_sin_cache_ptr
@@ -1352,7 +1319,6 @@ def _welmv4_inplace_rope_segmented_mirror_kernel_npu(
                 + sin_offsets[None, :],
                 mask=token_mask[:, None],
                 other=0.0,
-                care_padding=False,
             )
             if num_k_heads == 1:
                 _welmv4_apply_token_block_rope_npu(
@@ -1442,7 +1408,6 @@ def _welmv4_inplace_rope_head_parallel_prefill_kernel_npu(
                 + cos_offsets[None, :],
                 mask=token_mask[:, None],
                 other=0.0,
-                care_padding=False,
             )
             sin = tl.load(
                 cos_sin_cache_ptr
@@ -1450,20 +1415,17 @@ def _welmv4_inplace_rope_head_parallel_prefill_kernel_npu(
                 + sin_offsets[None, :],
                 mask=token_mask[:, None],
                 other=0.0,
-                care_padding=False,
             )
         else:
             cos = tl.load(
                 cos_sin_cache_ptr
                 + position_ids[:, None] * rope_dim
                 + cos_offsets[None, :],
-                care_padding=False,
             )
             sin = tl.load(
                 cos_sin_cache_ptr
                 + position_ids[:, None] * rope_dim
                 + sin_offsets[None, :],
-                care_padding=False,
             )
         if position_mode == 0:
             tl.extra.cann.extension.compile_hint(cos, "mayDiscretememaccess")
@@ -1595,11 +1557,9 @@ def _welmv4_inplace_rope_head_parallel_mirror_kernel_npu(
             q_position = tl.load(position_ptr + q_source_token).to(tl.int32)
             q_cos = tl.load(
                 cos_sin_cache_ptr + q_position * rope_dim + cos_offsets,
-                care_padding=False,
             )
             q_sin = tl.load(
                 cos_sin_cache_ptr + q_position * rope_dim + sin_offsets,
-                care_padding=False,
             )
             q_data = (
                 q_ptr
@@ -1640,7 +1600,6 @@ def _welmv4_inplace_rope_head_parallel_mirror_kernel_npu(
                     + cos_offsets[None, :],
                     mask=token_mask[:, None],
                     other=0.0,
-                    care_padding=False,
                 )
                 sin = tl.load(
                     cos_sin_cache_ptr
@@ -1648,20 +1607,17 @@ def _welmv4_inplace_rope_head_parallel_mirror_kernel_npu(
                     + sin_offsets[None, :],
                     mask=token_mask[:, None],
                     other=0.0,
-                    care_padding=False,
                 )
             else:
                 cos = tl.load(
                     cos_sin_cache_ptr
                     + position_ids[:, None] * rope_dim
                     + cos_offsets[None, :],
-                    care_padding=False,
                 )
                 sin = tl.load(
                     cos_sin_cache_ptr
                     + position_ids[:, None] * rope_dim
                     + sin_offsets[None, :],
-                    care_padding=False,
                 )
             k_data = (
                 k_ptr
