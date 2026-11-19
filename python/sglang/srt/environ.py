@@ -780,6 +780,8 @@ class Envs:
     # PD decode target only: attention RS/AG with DeepEP LOW_LATENCY,
     # including fixed-width MTP verify. Prefill and NextN keep their paths.
     SGLANG_WELMV4_DECODE_RS_AG = EnvBool(False)
+    # Fixed single-row BF16 WeLMV4 MegaKernel Decode on Ascend.
+    SGLANG_WELMV4_MK_DECODE_FAST_PATH = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_WELMV4_MIRROR_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = (
         EnvInt(None)

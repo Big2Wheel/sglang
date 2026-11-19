@@ -1116,7 +1116,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.backend.capture_one(
                     shape_key,
                     run_once,
-                    capture_inputs=None,
+                    capture_inputs=(
+                        forward_batch
+                        if getattr(self.backend, "uses_fixed_decode_prologue", False)
+                        else None
+                    ),
                     post_warmup_hook=post_warmup_hook,
                 )
                 if read_done is not None:

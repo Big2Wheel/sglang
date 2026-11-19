@@ -12,6 +12,7 @@ from sgl_kernel_npu.attention.sinks_attention import (
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
 )
@@ -151,6 +152,7 @@ class ForwardMetadata:
     # Full MK Decode takes these AiCPU-produced schedules as fixed graph inputs.
     # None preserves normal Eager and ACLGraph behavior.
     welm_mk_schedule_recipes: Optional[dict] = None
+    welm_mk_defer_page_prologue: bool = False
     welm_mk_schedule_bootstrap: bool = False
     # Ordinary prefill consumers use one Q per request, unlike source layers.
     welm_flash_mirror_q_lengths: Optional[tuple[torch.Tensor, torch.Tensor]] = None
@@ -1451,7 +1453,10 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.out_cache_loc,
                 welm_decode_metadata_in_graph=(
                     self.capture_welm_decode_metadata
-                    and not get_bool_env_var("WELM_NPU_USE_MK_TARGET_DECODE")
+                    and (
+                        not get_bool_env_var("WELM_NPU_USE_MK_TARGET_DECODE")
+                        or self._use_welm_mk_decode_fast_path()
+                    )
                     and forward_batch.forward_mode.is_decode_or_idle()
                     and forward_batch.spec_info is None
                     and not forward_batch.is_extend_in_batch
@@ -1480,7 +1485,10 @@ class AscendAttnBackend(AttentionBackend):
         )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
-        if self.forward_metadata.welm_decode_metadata_in_graph:
+        if (
+            self.forward_metadata.welm_decode_metadata_in_graph
+            and not self.forward_metadata.welm_mk_defer_page_prologue
+        ):
             self._prepare_welm_decode_metadata_device(forward_batch)
         if self.use_welm_flash_attn:
             # run_once invokes this for each warmup AND the actual capture.
@@ -1493,12 +1501,35 @@ class AscendAttnBackend(AttentionBackend):
                 metadata.welm_flash_schedules.clear()
             metadata.welm_flash_mirror_q_lengths = None
 
+    def _use_welm_mk_decode_fast_path(self) -> bool:
+        return (
+            envs.SGLANG_WELMV4_MK_DECODE_FAST_PATH.get()
+            and get_bool_env_var("WELM_NPU_USE_MK_TARGET_DECODE")
+        )
+
     def _prepare_welm_decode_metadata_device(
         self, forward_batch: ForwardBatch
     ) -> None:
         """Capture ordinary decode metadata from fixed registry input buffers."""
         metadata = self.forward_metadata
         seq_lens = forward_batch.seq_lens
+        if self._use_welm_mk_decode_fast_path():
+            from .welm_decode_page_prologue import prepare_page_prologue
+
+            prepare_page_prologue(
+                self.req_to_token,
+                forward_batch.req_pool_indices,
+                seq_lens,
+                forward_batch.out_cache_loc,
+                self.full_to_swa_index_mapping,
+                metadata.block_tables,
+                metadata.block_tables_swa,
+                metadata.swa_out_cache_loc,
+                metadata.welm_flash_seqused_q,
+                metadata.welm_flash_seqused_kv,
+                self.page_size,
+            )
+            return
         valid_rows = seq_lens > 0
         self._prepare_welm_graph_page_tables_device(
             metadata,
@@ -1751,9 +1782,32 @@ class AscendAttnBackend(AttentionBackend):
             )
         if self.use_sliding_window_kv_pool:
             # Shared by capture buckets, updated before attention consumes it.
+            location_dtype = torch.int64
+            if self._use_welm_mk_decode_fast_path():
+                pool = getattr(self.token_to_kv_pool, "swa_kv_pool", None)
+                if (
+                    not (
+                        self.is_welm_v4
+                        and self.is_hybrid_swa
+                        and self.use_welm_flash_attn
+                        and self.use_fia
+                    )
+                    or self.use_mla
+                    or self.model_dtype != torch.bfloat16
+                    or self.speculative_num_draft_tokens not in (None, 0)
+                    or max_bs != 1
+                    or max_num_tokens != 1
+                    or pool is None
+                    or not getattr(pool, "use_scatter_pa_kv_cache", False)
+                    or not 0 < pool.size + self.page_size <= torch.iinfo(torch.int32).max
+                ):
+                    raise RuntimeError("INT32 SWA requires the fixed WeLM ScatterPa Decode ABI")
+                # The existing metadata copy handles this conversion once.
+                # Every layer then reads the same INT32 device allocation.
+                location_dtype = torch.int32
             self.swa_out_cache_loc_buf = torch.zeros(
                 max_num_tokens,
-                dtype=torch.int64,
+                dtype=location_dtype,
                 device=self.device,
             )
         # V4-specific extra graph buffers. Default no-op on the base class;

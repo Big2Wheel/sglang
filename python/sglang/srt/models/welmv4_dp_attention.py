@@ -1675,6 +1675,17 @@ class WelmDpAttentionExecutor:
         state.hidden_states.masked_fill_(invalid_mask[:, None], 0)
         state.residual.masked_fill_(invalid_mask[:, None], 0)
 
+        fuse_postmerge_mask = (
+            envs.SGLANG_WELMV4_MK_DECODE_FAST_PATH.get()
+            and get_bool_env_var("WELM_NPU_USE_MK_TARGET_DECODE")
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and forward_batch.spec_info is None
+            and state.hidden_states.device.type == "npu"
+            and state.hidden_states.dtype == torch.bfloat16
+            and state.hidden_states.shape[0] == 1
+            and layer.mlp.shared_expert is not None
+        )
+
         # AUTO already resolves this group-wide non-extend round to LL.
         # Retain legal, distinct TopK IDs for dummy rows and zero only their
         # weights; NORMAL's -1 sentinel is not part of the LL contract.
@@ -1690,9 +1701,11 @@ class WelmDpAttentionExecutor:
             invalid_row_mask=invalid_mask,
             invalid_topk_id=None,
             allow_inplace_expert_shared_merge=True,
+            fuse_postmerge_mask=fuse_postmerge_mask,
         )
         state.hidden_states = self._store_final_components(layer, mlp_output)
-        state.hidden_states.masked_fill_(invalid_mask[:, None], 0)
+        if not fuse_postmerge_mask:
+            state.hidden_states.masked_fill_(invalid_mask[:, None], 0)
 
         if layer.is_final_layer:
             # Restore this DP shard for logits and physical NextN MTP. Keep

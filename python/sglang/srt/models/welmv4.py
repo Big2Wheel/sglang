@@ -1140,6 +1140,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         invalid_row_mask: Optional[torch.Tensor] = None,
         invalid_topk_id: Optional[int] = None,
         allow_inplace_expert_shared_merge: bool = False,
+        fuse_postmerge_mask: bool = False,
         resolved_moe_tp_group=None,
         resolved_moe_ep_group=None,
     ) -> torch.Tensor:
@@ -1475,6 +1476,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         final_hidden_states = experts_output
         self.last_final_experts_output = None
         self.last_final_shared_output = None
+        if fuse_postmerge_mask and (
+            not allow_inplace_expert_shared_merge
+            or return_components
+            or use_reduce_scatter
+            or not moe_a2a_backend.is_deepep()
+            or shared_output is None
+            or invalid_row_mask is None
+            or self.welm_runner_plan is None
+            or not self.welm_runner_plan.has_moe_ep
+        ):
+            raise RuntimeError("PostMoE fused tail needs in-place DeepEP expert sum")
         if shared_output is not None:
             if (
                 self.layer_id == self.num_hidden_layers - 1
@@ -1487,7 +1499,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             if enable_npu_shared_alt_stream:
                 # Normal inference first consumes shared_output in this add.
                 wait_share_stream()
-            if allow_inplace_expert_shared_merge:
+            if fuse_postmerge_mask:
+                from sglang.srt.models.welmv4_post_moe import merge_and_mask
+
+                merge_and_mask(final_hidden_states, shared_output, invalid_row_mask)
+            elif allow_inplace_expert_shared_merge:
                 final_hidden_states.add_(shared_output)
             else:
                 final_hidden_states = final_hidden_states + shared_output

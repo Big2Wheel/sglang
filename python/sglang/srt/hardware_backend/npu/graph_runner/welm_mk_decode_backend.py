@@ -9,6 +9,7 @@ import tempfile
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
     NPUCudaGraphBackend,
 )
@@ -72,9 +73,15 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
         self._directory = tempfile.TemporaryDirectory(prefix="welm-mk-target-")
         # NpuGraphReadDone's flag handshake belongs to torch.npu.NPUGraph.
         # Keep the scheduler WAR barrier, with its whole-forward wait fallback.
+        self.uses_fixed_decode_prologue = envs.SGLANG_WELMV4_MK_DECODE_FAST_PATH.get()
+        if self.uses_fixed_decode_prologue and (
+            is_verify or not envs.SGLANG_WELMV4_DECODE_RS_AG.get()
+        ):
+            raise ValueError("Fixed WeLM MegaKernel Decode requires Decode RS/AG without MTP")
         runner.model_runner.welm_graph_read_done_enabled = False
         self._attn_backend = runner.attn_backend
         self._metadata = {}
+        self._page_prologue_batches = {}
         self._replays = {}
         self._ineligible_shapes = set()
 
@@ -107,6 +114,18 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
         self._device_module.synchronize()
         self._tp_group.barrier()
         metadata = self._attn_backend.forward_metadata
+        page_prologue = self.uses_fixed_decode_prologue
+        if page_prologue and (
+            not metadata.welm_decode_metadata_in_graph
+            or capture_inputs is None
+            or not capture_inputs.forward_mode.is_decode_or_idle()
+            or capture_inputs.spec_info is not None
+            or capture_inputs.seq_lens.shape != (1,)
+            or capture_inputs.out_cache_loc is None
+            or capture_inputs.out_cache_loc.shape != (1,)
+            or metadata.seq_lens is not capture_inputs.seq_lens
+        ):
+            raise RuntimeError("Device page prologue requires an ordinary, fixed single-row Decode capture")
         metadata.welm_mk_schedule_recipes = {}
         metadata.welm_mk_schedule_bootstrap = True
         try:
@@ -154,9 +173,19 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
             hooks.append(layer.register_forward_hook(leave))
         try:
             try:
+                # The native dummy warmup above populated the stable metadata
+                # buffers. Exclude only the producers from this inner recorder:
+                # the outer ACL graph records them before every model replay.
+                metadata.welm_mk_defer_page_prologue = page_prologue
                 with LowerConcats():
-                    graph = capture_fixed(capture_outputs, path, prepared=True)
+                    graph = capture_fixed(
+                        capture_outputs,
+                        path,
+                        prepared=True,
+                        welm_decode_layers=self._layer_count if page_prologue else 0,
+                    )
             finally:
+                metadata.welm_mk_defer_page_prologue = False
                 for hook in hooks:
                     hook.remove()
         except Exception:
@@ -202,6 +231,8 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
             **dict(zip(output_fields, graph.outputs, strict=True))
         )
         self._metadata[shape_key] = metadata
+        if page_prologue:
+            self._page_prologue_batches[shape_key] = capture_inputs
         self._replays[shape_key] = 0
 
     def replay(self, shape_key, static_forward_batch, **kwargs):
@@ -209,12 +240,25 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
         metadata = self._metadata[shape_key]
         if self._attn_backend.forward_metadata is not metadata:
             raise RuntimeError("WeLM MK Decode metadata identity changed")
-        with profile_range("welm.mk.attn_metadata"):
-            for key, (dims, common) in metadata.welm_mk_schedule_recipes.items():
-                updated = self._attn_backend._welm_flash_attn_metadata(*dims, **common)
-                metadata.welm_flash_schedules[key].copy_(updated, non_blocking=True)
+        captured_inputs = self._page_prologue_batches.get(shape_key)
+
+        def update_metadata():
+            if captured_inputs is not None:
+                # Captured tensors are the buffer registry views used by the
+                # model; load_batch writes current values there before replay.
+                self._attn_backend._prepare_welm_decode_metadata_device(captured_inputs)
+            with profile_range("welm.mk.attn_metadata"):
+                for key, (dims, common) in metadata.welm_mk_schedule_recipes.items():
+                    updated = self._attn_backend._welm_flash_attn_metadata(*dims, **common)
+                    metadata.welm_flash_schedules[key].copy_(updated, non_blocking=True)
+
+        if captured_inputs is None:
+            update_metadata()
         with profile_range("welm.mk.replay"):
-            graph.replay()
+            if captured_inputs is None:
+                graph.replay()
+            else:
+                graph.replay(before_acl_capture=update_metadata)
         count = self._replays[shape_key] + 1
         self._replays[shape_key] = count
         if count <= 3 or count % 128 == 0:

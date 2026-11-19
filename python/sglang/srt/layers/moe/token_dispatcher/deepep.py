@@ -935,7 +935,23 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-        topk_ids = topk_ids.to(torch.int64)
+        # The Ascend default strategy casts these same IDs to INT32 at
+        # BOTH SDK boundaries. Keep the input representation for this
+        # fixed BF16, single-row LOW_LATENCY path. Leave other strategies alone.
+        strategy = getattr(buffer, "low_latency_strategy", None)
+        retain_int32 = (
+            envs.SGLANG_WELMV4_MK_DECODE_FAST_PATH.get()
+            and get_bool_env_var("WELM_NPU_USE_MK_TARGET_DECODE")
+            and hidden_states.device.type == "npu"
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.shape[0] == 1
+            and topk_ids.dtype == torch.int32
+            and topk_weights.dtype == torch.float32
+            and type(strategy).__module__ == "deep_ep.strategies.low_latency_strategy"
+            and type(strategy).__name__ == "DefaultLowLatencyCommStrategy"
+        )
+        if not retain_int32:
+            topk_ids = topk_ids.to(torch.int64)
         expected_m = (
             hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
             + self.num_experts
