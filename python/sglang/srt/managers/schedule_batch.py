@@ -106,6 +106,7 @@ from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
     SchedulerMetricsCollector,
 )
+from sglang.srt.observability.pd_time_stats import emit, request_record
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
     DPControllerReqTimeStats,
@@ -1161,6 +1162,9 @@ class Req(ReqDllmMixin):
         # For hisparse
         self.hisparse_staging = False
 
+        # Snapshot of the scheduler prefill-token counter taken at waiting_queue entry; used by HRRN aging.
+        self.arrival_processed_tokens: int = 0
+
     @property
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
@@ -1738,7 +1742,22 @@ class Req(ReqDllmMixin):
             f"attempts={self.prefill_attempt_count}, "
             f"type={self.time_stats.disagg_mode_str()})"
         )
-        logger.info(f"{prefix}: {self.time_stats.convert_to_duration()}")
+        message = f"{prefix}: {self.time_stats.convert_to_duration()}"
+        if self.time_stats.disagg_mode == DisaggregationMode.NULL:
+            # Keep the existing summary for log consumers. Queue both records on
+            # completion so the scheduler does not serialize JSON or write files.
+            emit("", message)
+            emit(
+                "UnifiedRequestStats ",
+                request_record(
+                    self, "request_finished", num_retractions=self.retraction_count
+                ),
+            )
+        elif self.bootstrap_room is not None:
+            emit("", message)
+            emit("PDRequestStats ", request_record(self, "request_finished"))
+        else:
+            logger.info(message)
         self.has_log_time_stats = True
 
     def set_finish_with_abort(self, error_msg: str):
@@ -2479,8 +2498,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
 
         if self.return_logprob:
+            # Pin so the non_blocking H2D copy in ForwardBatch.init_new is stream-ordered.
             extend_input_logprob_token_ids = torch.tensor(
-                extend_input_logprob_token_ids
+                extend_input_logprob_token_ids,
+                pin_memory=is_pin_memory_available(self.device),
             )
             # Clamp placeholder or out-of-range token IDs (e.g., multimodal hashes)
             # so they stay within the vocab boundary before being sent to GPU.

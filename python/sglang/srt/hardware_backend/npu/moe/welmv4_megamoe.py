@@ -38,6 +38,26 @@ def _weight_mode(experts):
     return None
 
 
+def _prepare_shared_expert_kwargs(shared, weight_mode):
+    """Reuse this WeLM layer's replicated shared weights without changing them."""
+    kwargs = {}
+    for name, projection in (
+        ("l1", shared.gate_up_proj),
+        ("l2", shared.down_proj),
+    ):
+        weight = projection.weight.detach()
+        if weight_mode == _MODE_MXFP8:
+            # Dense MXFP8 stores [K,N] / [K//64,N,2] transpose views.
+            weight = weight.transpose(0, 1)
+            scale = projection.weight_scale_inv.detach().transpose(0, 1).contiguous()
+            if scale.dtype == torch.uint8:
+                # ModelSlim stores E8M0 bytes, not integer-valued scales.
+                scale = scale.view(torch.float8_e8m0fnu)
+            kwargs[f"{name}_weights_shared_sf"] = [scale.unsqueeze(0)]
+        kwargs[f"{name}_weights_shared"] = [weight.contiguous().unsqueeze(0)]
+    return kwargs
+
+
 class WelmPrefillMegaMoE:
     def __init__(self, group, *, config, device, weight_mode=_MODE_BF16):
         from npu_ops_transformer.ops.mega_moe import (
@@ -84,7 +104,7 @@ class WelmPrefillMegaMoE:
         # per-rank MoE rows or the sequence length including cached prefixes.
         return (
             self.prefill_token_threshold <= 0
-            or num_tokens > self.prefill_token_threshold
+            or num_tokens >= self.prefill_token_threshold
         )
 
     def can_run(self, num_rows: int) -> bool:
@@ -106,13 +126,17 @@ class WelmPrefillMegaMoE:
         num_valid_rows: int,
         *,
         zero_output_padding: bool = True,
+        valid_row_mask: torch.Tensor | None = None,
+        shared_kwargs: dict | None = None,
     ):
         # The caller skips DeepEP's -1 masking. TopK IDs are already legal and
         # distinct, including padding rows; only their mixture weights need 0.
         ids = topk_output.topk_ids.to(torch.int32)
         weights = topk_output.topk_weights.to(torch.bfloat16)
         has_padding = num_valid_rows < hidden_states.shape[0]
-        if has_padding:
+        if valid_row_mask is not None:
+            weights.masked_fill_(~valid_row_mask[:, None], 0)
+        elif has_padding:
             # TopK returns FP32: the cast above owns a new BF16 tensor. Clear
             # only its suffix, without another full tensor copy or mask kernel.
             weights[num_valid_rows:].zero_()
@@ -125,6 +149,8 @@ class WelmPrefillMegaMoE:
                 l2_weights_sf=[experts.w2_weight_scale],
                 x_active_mask=None,
             )
+        if shared_kwargs is not None:
+            quant_args.update(shared_kwargs)
         output, _ = self._mega_moe(
             hidden_states,
             ids,
@@ -137,7 +163,9 @@ class WelmPrefillMegaMoE:
             self.symm_buffer,
             **quant_args,
         )
-        if has_padding and zero_output_padding:
+        if valid_row_mask is not None and zero_output_padding:
+            output.masked_fill_(~valid_row_mask[:, None], 0)
+        elif has_padding and zero_output_padding:
             output[num_valid_rows:].zero_()
         return output
 
@@ -164,12 +192,8 @@ def init_welm_prefill_megamoe(model_runner):
     for layer in model_runner.model.model.layers:
         mlp = getattr(layer, "mlp", None)
         experts = getattr(mlp, "experts", None)
-        if (
-            experts is None
-            or mlp.is_nextn
-            or mlp.is_kv_mirror_consumer
-            or not mlp.welm_local_ep_kernel_available
-        ):
+        # Bind only layers whose weights were prepared for MegaMoE at load time.
+        if not getattr(experts, "welm_megamoe_keep_nd", False):
             continue
         if _weight_mode(experts) is None:
             continue
@@ -205,8 +229,13 @@ def init_welm_prefill_megamoe(model_runner):
         weight_mode=weight_mode,
     )
     _RUNTIMES[group] = runtime
+    fuse_shared = envs.WELM_NPU_MEGAMOE_FUSE_SHARED_EXPERT.get()
     for mlp in eligible:
         mlp.welm_prefill_megamoe = runtime
+        if fuse_shared and mlp.shared_expert is not None:
+            mlp.welm_megamoe_shared_kwargs = _prepare_shared_expert_kwargs(
+                mlp.shared_expert, weight_mode
+            )
     return runtime
 
 

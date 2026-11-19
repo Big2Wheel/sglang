@@ -70,6 +70,9 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
                 "Model-level MegaKernel requires the complete local decoder stack"
             )
         self._directory = tempfile.TemporaryDirectory(prefix="welm-mk-target-")
+        # NpuGraphReadDone's flag handshake belongs to torch.npu.NPUGraph.
+        # Keep the scheduler WAR barrier, with its whole-forward wait fallback.
+        runner.model_runner.welm_graph_read_done_enabled = False
         self._attn_backend = runner.attn_backend
         self._metadata = {}
         self._replays = {}

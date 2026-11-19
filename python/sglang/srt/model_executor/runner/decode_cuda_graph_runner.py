@@ -264,6 +264,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm = self.dllm_config is not None
         self.attn_backend = attn_backend or model_runner.attn_backend
+        self.welm_read_done_by_key = {}
         self.speculative_num_steps = (
             get_spec().speculative_num_steps
             if speculative_num_steps is None
@@ -395,6 +396,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.buffers.share_buffers()
         self.welm_dp_real_rows_gpu = None
         self.welm_dp_capture_row_layouts = {}
+        self.welm_decode_tp_capture_batches = {}
         target_plan = _welm_target_plan(model_runner)
         if target_plan is not None:
             # This buffer is deliberately runner-private: the registry-owned
@@ -998,6 +1000,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             bs, stream_idx=stream_idx, num_tokens=num_tokens
         )
 
+        shape_key = self._make_graph_key(
+            self._capture_graph_size(bs=bs, num_tokens=num_tokens),
+            stream_idx,
+            variant_label,
+        )
+        read_done = None
+        if self.model_runner.welm_graph_read_done_enabled:
+            from sglang.srt.hardware_backend.npu.graph_runner.graph_read_done import (
+                NpuGraphReadDone,
+            )
+
+            if shape_key in self.welm_read_done_by_key:
+                raise RuntimeError("Cannot replace a live WeLM read-done graph owner")
+            read_done = NpuGraphReadDone(device=self.device)
+            self.welm_read_done_by_key[shape_key] = read_done
+            forward_batch.welm_graph_read_done = read_done
+
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
         # DeepEP adapter, …) so they must run inside the same ForwardContext
         # that wraps the warmup/capture forward.
@@ -1010,6 +1029,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
             def run_once():
+                if read_done is not None:
+                    read_done.begin_capture_forward()
                 # Graph-recordable metadata-prep hook. The unified memory pool
                 # records ZERO translate nodes here: all its read/write translates
                 # run eagerly in `init_forward_metadata_out_graph` (replay-prep), so
@@ -1067,11 +1088,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # wires no buffer here. (SWA write loc rides the `swa_out_cache_loc` rail.)
 
             with canary_ctx:
-                shape_key = self._make_graph_key(
-                    self._capture_graph_size(bs=bs, num_tokens=num_tokens),
-                    stream_idx,
-                    variant_label,
-                )
+                if (
+                    getattr(self.model_runner, "welm_decode_rs_ag_enabled", False)
+                    and _welm_target_plan(self.model_runner) is None
+                ):
+                    # Warmup below allocates the pure-TP mask scratch on this
+                    # batch. Retain its tensors across every graph replay.
+                    self.welm_decode_tp_capture_batches[shape_key] = forward_batch
                 if forward_batch.welm_dp_moe_row_layout is not None:
                     # Keep every captured shape's batch-owned transport
                     # scratch alive for the graph lifetime.  Different target,
@@ -1096,6 +1119,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     capture_inputs=None,
                     post_warmup_hook=post_warmup_hook,
                 )
+                if read_done is not None:
+                    read_done.after_capture()
 
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
         if self.capture_hidden_mode < forward_batch.capture_hidden_mode:

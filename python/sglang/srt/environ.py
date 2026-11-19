@@ -428,6 +428,7 @@ class Envs:
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
+    SGLANG_ASCEND_PD_KV_WRITERS = EnvStr(None)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS = EnvInt(0)
@@ -497,6 +498,9 @@ class Envs:
 
     # Tool Calling
     SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
+    # Opt in to the WeLM service patch (98105d14dc) and worker mask reuse.
+    # Set before worker startup; changing this at runtime is unsupported.
+    SGLANG_ENABLE_WELM_SERVICE_PATCH = EnvBool(False)
 
     # Native web search (Exa). EXA_API_KEY is the vendor BYOK credential
     # (kept as-is, not renamed to SGLANG_*); the SGLANG_EXA_* knobs tune the
@@ -643,11 +647,18 @@ class Envs:
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
-    # BF16/MXFP8 WeLM target prefill, non-consumer EP; only shared gate/up may
-    # overlap TopK with NPU multi-stream enabled. The rest precedes MegaMoE.
+    # Use separate HCCL send/receive buffers for ordinary NPU all-reduce.
+    # Process-wide opt-in; supports contiguous FP16/BF16/FP32 base formats.
+    SGLANG_NPU_ALLREDUCE_OUTPLACE = EnvBool(False)
+    # Keep BF16/MXFP8 routed expert weights in ND for every WeLM layer.
+    WELM_NPU_MOE_USE_ND = EnvBool(False)
+    # BF16/MXFP8 WeLM target prefill, non-consumer EP.
     WELM_NPU_USE_MEGAMOE = EnvBool(False)
+    # Fuse shared experts on selected MegaMoE calls, including prefill BCG.
+    WELM_NPU_MEGAMOE_FUSE_SHARED_EXPERT = EnvBool(False)
     # With MegaMoE enabled, require padded prefill rows before attention-TP
-    # scattering to exceed this threshold. Zero keeps the existing selection.
+    # scattering to meet or exceed this threshold. Non-positive values disable
+    # this threshold check.
     WELM_NPU_MEGAMOE_PREFILL_TOKEN_THRESHOLD = EnvInt(0)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2
@@ -766,17 +777,37 @@ class Envs:
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)  # This argument is deprecated
     SGLANG_DEEPEP_NORMAL_USE_ALLTOALL = EnvBool(False)
     SGLANG_DEEPEP_NORMAL_USE_ALLGATHER = EnvBool(False)
+    # PD decode target only: attention RS/AG with DeepEP LOW_LATENCY,
+    # including fixed-width MTP verify. Prefill and NextN keep their paths.
+    SGLANG_WELMV4_DECODE_RS_AG = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_WELMV4_MIRROR_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = (
         EnvInt(None)
     )
     SGLANG_NPU_PREFILL_OPROJ_MATMUL_REDUCE_SCATTER = EnvBool(False)
-    # An enabled pipeline with fewer than two chunks uses ordinary MM + RS,
-    # regardless of the fusion switch above. MAX_CHUNKS < 2 keeps the old path.
+    # An enabled pipeline with fewer than two chunks follows the fusion switch
+    # above: fused MM+RS when enabled, ordinary MM + RS otherwise.
+    # MAX_CHUNKS < 2 keeps the existing non-pipeline path.
     SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MIN_CHUNK_TOKENS = EnvInt(1024)
     SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MAX_CHUNKS = EnvInt(0)
+    # BF16/MXFP8 QKV AG settings apply to Full and, unless overridden, SWA.
+    # MIN_CHUNK_TOKENS counts gathered rows; MAX_CHUNKS < 2 disables chunking.
     SGLANG_NPU_PREFILL_AG_FUSED_QKV_MIN_CHUNK_TOKENS = EnvInt(1024)
     SGLANG_NPU_PREFILL_AG_FUSED_QKV_MAX_CHUNKS = EnvInt(0)
+    # Each unset SWA override inherits its corresponding common setting.
+    SGLANG_NPU_PREFILL_AG_FUSED_QKV_SWA_MIN_CHUNK_TOKENS = EnvInt(None)
+    SGLANG_NPU_PREFILL_AG_FUSED_QKV_SWA_MAX_CHUNKS = EnvInt(None)
+    # Request buckets B for the WeLM BF16 KV-mirror suffix graph, whose
+    # Q/hidden/MoE have B rows. Prompt graphs (including mirror K/V preparation)
+    # use only the token buckets in cuda_graph_config.prefill.bs: T + B captures,
+    # not T x B. max(B) also sizes the fixed tail-index/RoPE metadata handoff.
+    # With --enable-mixed-chunk, these are capacities: round the real request
+    # count (prefill + running decode) up to Bcap; dummy outputs are discarded.
+    # Without mixed chunk, retain exact B (e.g. unlisted B=3 is not padded to 4).
+    # If either T or B is uncovered, the ENTIRE body falls back to eager;
+    # mixed eager-prompt/graph-mirror execution is unsupported.
+    # Without pruning there is only the T graph, with request count <= max(B).
+    SGLANG_WELMV4_PREFILL_GRAPH_BATCH_SIZES = EnvStr("1,2,4,8")
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     # Force dynamic Waterfill with runtime EP all-reduce instead of the default

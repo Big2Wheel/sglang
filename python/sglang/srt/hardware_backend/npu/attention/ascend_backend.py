@@ -135,11 +135,15 @@ class ForwardMetadata:
     full_sink_prefill_schedule_key: Optional[tuple] = None
 
     # FlashAttn separates physical TND offsets from effective sequence lengths.
-    # Graph capture owns these buffers; replay updates their contents in place.
+    # Graph capture owns these buffers; replay preparation or the captured
+    # metadata prologue updates their contents in place.
     welm_flash_cu_seqlens_q: Optional[torch.Tensor] = None
     welm_flash_seqused_q: Optional[torch.Tensor] = None
     welm_flash_seqused_kv: Optional[torch.Tensor] = None
     welm_flash_max_seqlen_q: int = -1
+
+    # Fixed at capture time: replay must use the same metadata preparation path.
+    welm_decode_metadata_in_graph: bool = False
 
     # Read-only schedules shared by equal attention geometries in this forward.
     # Each graph bucket owns its capture outputs; never share across forwards.
@@ -462,6 +466,14 @@ class AscendAttnBackend(AttentionBackend):
             self.dllm_block_size = self.dllm_config.block_size
 
         self.attn_cp_size = model_runner.ps.attn_cp_size
+        # Set before DecodeCudaGraphRunner starts capturing in its constructor.
+        # Speculative/draft and other attention paths retain eager preparation.
+        self.capture_welm_decode_metadata = (
+            self.use_welm_flash_attn
+            and model_runner.spec_algorithm.is_none()
+            and not model_runner.is_draft_worker
+            and not self.is_dllm_model
+        )
 
     def _is_swa_layer(self, layer: RadixAttention) -> bool:
         if not self.is_hybrid_swa:
@@ -508,7 +520,9 @@ class AscendAttnBackend(AttentionBackend):
             and not self.use_welm_flash_attn
         )
 
-    def _prepare_welm_flash_metadata_inputs(self, forward_batch: ForwardBatch) -> None:
+    def _prepare_welm_flash_metadata_inputs(
+        self, forward_batch: ForwardBatch, *, pin_memory: bool = False
+    ) -> None:
         """Build eager FlashAttn lengths from the pre-collective local batch.
 
         KV lengths have already been normalized for the forward mode. Keep
@@ -535,13 +549,158 @@ class AscendAttnBackend(AttentionBackend):
                 max(1, int(q_lens_cpu.max().item())) if bs else 1
             )
         metadata.extend_seq_lens_cpu_int = q_lens_cpu
+        if pin_memory:
+            # Fresh staging; async copies may outlive this Python call under
+            # scheduler overlap. Never refill an in-flight pinned CPU buffer.
+            q_lens_cpu = q_lens_cpu.pin_memory()
         metadata.welm_flash_seqused_q = q_lens_cpu.to(self.device, non_blocking=True)
-        cu_q_cpu = torch.zeros(bs + 1, dtype=torch.int32, device="cpu")
+        cu_q_cpu = torch.zeros(
+            bs + 1, dtype=torch.int32, device="cpu", pin_memory=pin_memory
+        )
         torch.cumsum(q_lens_cpu, dim=0, out=cu_q_cpu[1:])
         metadata.welm_flash_cu_seqlens_q = cu_q_cpu.to(self.device, non_blocking=True)
         metadata.welm_flash_seqused_kv = torch.where(
             forward_batch.seq_lens > 0, metadata.seq_lens, 0
         ).to(torch.int32)
+
+    def create_welm_prefill_graph_metadata(self, max_requests: int) -> ForwardMetadata:
+        """Private prefill inputs; never alias decode's graph_metadata buffers."""
+        if not hasattr(torch_npu, "npu_scatter_pa_kv_cache"):
+            raise RuntimeError(
+                "WeLM Flash prefill graph requires npu_scatter_pa_kv_cache "
+                "with negative-slot masking support"
+            )
+        max_blocks = (self.max_context_len + self.page_size - 1) // self.page_size
+        tables = torch.zeros(
+            (max_requests, max_blocks), dtype=torch.int32, device=self.device
+        )
+        return ForwardMetadata(
+            block_tables=tables,
+            block_tables_swa=torch.zeros_like(tables) if self.is_hybrid_swa else None,
+            welm_flash_seqused_q=torch.zeros(
+                max_requests, dtype=torch.int32, device=self.device
+            ),
+            welm_flash_seqused_kv=torch.zeros(
+                max_requests, dtype=torch.int32, device=self.device
+            ),
+            # The actual max(E_i) varies within a T bucket. Flash's explicit
+            # max length attribute requires an exact value, not an upper bound.
+            welm_flash_max_seqlen_q=-1,
+        )
+
+    def prepare_welm_prefill_graph_metadata(
+        self, metadata: ForwardMetadata, batch: ForwardBatch, *, capture: bool = False
+    ) -> None:
+        """Update only the adapter-owned inputs, on the current forward stream.
+
+        Page-table columns are fixed to context capacity; only live pages are
+        gathered. Both phases share these inputs and replay in stream order.
+        No device lengths are read back and no eager/decode state is rebound.
+        """
+        bs = batch.batch_size
+        max_seq_len = int(batch.seq_lens_cpu.max().item())
+        if (
+            bs > metadata.welm_flash_seqused_kv.numel()
+            or max_seq_len > self.max_context_len
+        ):
+            raise ValueError("WeLM prefill Flash metadata capacity exceeded")
+        metadata.welm_flash_seqused_q.zero_()
+        metadata.welm_flash_seqused_q[:bs].copy_(batch.extend_seq_lens)
+        metadata.welm_flash_seqused_kv.zero_()
+        metadata.welm_flash_seqused_kv[:bs].copy_(batch.seq_lens)
+        metadata.block_tables.zero_()
+        if metadata.block_tables_swa is not None:
+            metadata.block_tables_swa.zero_()
+        if capture:
+            # Startup dummy requests read the reserved zero page, independent
+            # of unallocated entries in req_to_token / Full->SWA mappings.
+            return
+        page_tokens = self.req_to_token_pool.req_to_token[
+            batch.req_pool_indices, : max_seq_len : self.page_size
+        ]
+        num_pages = page_tokens.shape[1]
+        metadata.block_tables[:bs, :num_pages].copy_(page_tokens // self.page_size)
+        if metadata.block_tables_swa is not None:
+            metadata.block_tables_swa[:bs, :num_pages].copy_(
+                self.full_to_swa_index_mapping[page_tokens] // self.page_size
+            )
+
+    def prepare_welm_prefill_graph_metadata_device(
+        self,
+        metadata: ForwardMetadata,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        page_starts: torch.Tensor,
+        page_in_bounds: torch.Tensor,
+    ) -> None:
+        """Capture prefill metadata from the adapter's fixed Bmax inputs.
+
+        Replay clears only unused E rows; every consumer masks req/seq tails
+        with E>0. Capture dummy requests retain legal Q/KV lengths but use
+        reserved request 0, whose page tables must remain zero.
+        """
+        has_q = extend_seq_lens > 0
+        metadata.welm_flash_seqused_q.copy_(extend_seq_lens)
+        metadata.welm_flash_seqused_kv.copy_(torch.where(has_q, seq_lens, 0))
+        self._prepare_welm_graph_page_tables_device(
+            metadata,
+            req_pool_indices,
+            seq_lens,
+            has_q & (req_pool_indices > 0),
+            page_starts,
+            page_in_bounds,
+        )
+
+    def _prepare_welm_graph_page_tables_device(
+        self,
+        metadata: ForwardMetadata,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        valid_rows: torch.Tensor,
+        page_starts: torch.Tensor,
+        page_in_bounds: torch.Tensor,
+    ) -> None:
+        """Gather Full/SWA page heads into fixed graph-owned output tables."""
+        valid_pages = valid_rows[:, None] & (page_starts < seq_lens[:, None])
+        valid_pages = valid_pages & page_in_bounds
+
+        # Mask BEFORE gathering: padding and unused pages must not read stale
+        # entries of a real request (or use them to index the SWA mapping).
+        # ReqToTokenPool reserves row 0 for padding; token offset 0 is in bounds.
+        req_indices = torch.where(valid_pages, req_pool_indices[:, None], 0)
+        token_indices = torch.where(valid_pages, page_starts, 0)
+        full_page_locs = torch.where(
+            valid_pages, self.req_to_token[req_indices, token_indices], 0
+        )
+        metadata.block_tables.copy_(full_page_locs // self.page_size)
+        if self.is_hybrid_swa:
+            # Reuse upstream's page-head gather -> SWA mapping order. Full and
+            # SWA share the gather; never materialize a B x context token map.
+            # Floor division preserves the existing negative sentinel semantics.
+            swa_page_locs = self.full_to_swa_index_mapping[full_page_locs]
+            metadata.block_tables_swa.copy_(
+                torch.where(valid_pages, swa_page_locs, 0) // self.page_size
+            )
+
+    def write_welm_prefill_graph_kv(self, layer, k, v, full_locs, swa_locs) -> None:
+        """Fixed-row BF16 cache write for this graph path only.
+
+        Norm ScatterPaKvCache skips negative slot IDs. The generic prefill
+        writer can use scatter_nd, which has no such padding contract. Do not
+        change its default or the scatter environment policy for eager/decode.
+        """
+        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        slots = swa_locs if self._is_swa_layer(layer) else full_locs
+        torch_npu.npu_scatter_pa_kv_cache(
+            k.reshape(-1, layer.tp_k_head_num, layer.qk_head_dim).contiguous(),
+            v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim).contiguous(),
+            k_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim),
+            v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.v_head_dim),
+            slots.to(torch.int32).contiguous(),
+            cache_mode="Norm",
+        )
 
     def _forward_welm_flash_attention(
         self,
@@ -552,6 +711,7 @@ class AscendAttnBackend(AttentionBackend):
         sinks: Optional[torch.Tensor],
         *,
         mirror_prefill: bool = False,
+        graph_metadata: Optional[ForwardMetadata] = None,
         mk_decode: bool = False,
     ) -> torch.Tensor:
         """Paged Full/SWA attention with native FP32 sinks, eager or graph.
@@ -559,7 +719,7 @@ class AscendAttnBackend(AttentionBackend):
         Generate one schedule per Q family and attention geometry in this
         forward. The in-graph hook clears warmup results before actual capture.
         """
-        metadata = self.forward_metadata
+        metadata = self.forward_metadata if graph_metadata is None else graph_metadata
         query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
         padded_tokens = query.shape[0]
         kv_lens = metadata.welm_flash_seqused_kv
@@ -580,7 +740,7 @@ class AscendAttnBackend(AttentionBackend):
             max_q = metadata.welm_flash_max_seqlen_q
             num_tokens = (
                 padded_tokens
-                if self.graph_mode
+                if graph_metadata is not None or self.graph_mode
                 else int(metadata.extend_seq_lens_cpu_int.sum().item())
             )
         if num_tokens == 0:
@@ -668,9 +828,11 @@ class AscendAttnBackend(AttentionBackend):
                 [
                     output,
                     output.new_zeros(
-                        padded_tokens - num_tokens,
-                        layer.tp_q_head_num,
-                        layer.v_head_dim,
+                        (
+                            padded_tokens - num_tokens,
+                            layer.tp_q_head_num,
+                            layer.v_head_dim,
+                        )
                     ),
                 ],
                 dim=0,
@@ -1287,7 +1449,22 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.forward_mode,
                 forward_batch.seq_lens,
                 forward_batch.out_cache_loc,
+                welm_decode_metadata_in_graph=(
+                    self.capture_welm_decode_metadata
+                    and not get_bool_env_var("WELM_NPU_USE_MK_TARGET_DECODE")
+                    and forward_batch.forward_mode.is_decode_or_idle()
+                    and forward_batch.spec_info is None
+                    and not forward_batch.is_extend_in_batch
+                ),
             )
+        metadata = self.graph_metadata[bs]
+        if metadata.welm_decode_metadata_in_graph:
+            # The graph reads the registry inputs captured by run_once, not the
+            # live out_cache_loc carried by build_replay_fb_view. No device work
+            # belongs here: the prologue runs once inside the model graph.
+            self.forward_metadata = metadata
+            self.graph_mode = True
+            return
         self._apply_cuda_graph_metadata(
             bs=bs,
             req_pool_indices=forward_batch.req_pool_indices,
@@ -1303,6 +1480,8 @@ class AscendAttnBackend(AttentionBackend):
         )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        if self.forward_metadata.welm_decode_metadata_in_graph:
+            self._prepare_welm_decode_metadata_device(forward_batch)
         if self.use_welm_flash_attn:
             # run_once invokes this for each warmup AND the actual capture.
             # Capture must record fresh producers, not reuse warmup schedules.
@@ -1312,11 +1491,58 @@ class AscendAttnBackend(AttentionBackend):
                 or metadata.welm_mk_schedule_bootstrap
             ):
                 metadata.welm_flash_schedules.clear()
+            metadata.welm_flash_mirror_q_lengths = None
+
+    def _prepare_welm_decode_metadata_device(
+        self, forward_batch: ForwardBatch
+    ) -> None:
+        """Capture ordinary decode metadata from fixed registry input buffers."""
+        metadata = self.forward_metadata
+        seq_lens = forward_batch.seq_lens
+        valid_rows = seq_lens > 0
+        self._prepare_welm_graph_page_tables_device(
+            metadata,
+            forward_batch.req_pool_indices,
+            seq_lens,
+            valid_rows,
+            self.graph_metadata["welm_decode_page_starts"],
+            self.graph_metadata["welm_decode_page_in_bounds"],
+        )
+
+        if metadata.swa_out_cache_loc is not None:
+            full_write_locs = torch.where(valid_rows, forward_batch.out_cache_loc, 0)
+            swa_write_locs = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                full_write_locs
+            )
+            metadata.swa_out_cache_loc.copy_(
+                torch.where(valid_rows, swa_write_locs, 0)
+            )
+
+        # seq_lens already aliases the registry input; no self-copy is needed.
+        # cu_seqlens_q and max_seqlen_q are capture-bucket constants (one Q/row).
+        metadata.welm_flash_seqused_q.copy_(valid_rows)
+        metadata.welm_flash_seqused_kv.copy_(torch.where(valid_rows, seq_lens, 0))
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
-        seq_lens_max = forward_batch.seq_lens.max()
+        # Ordinary WeLM prefill already has authoritative CPU lengths. Avoid
+        # a device scalar as a Python slice bound and an extend-lens D2H: both
+        # would drain pending forward-stream work under scheduler overlap.
+        welm_cpu_prefill = (
+            self.use_welm_flash_attn
+            and self.model_dtype == torch.bfloat16
+            and not get_parallel().enable_dp_attention
+            and self.attn_cp_size == 1
+            and forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            and forward_batch.seq_lens_cpu is not None
+            and forward_batch.extend_seq_lens_cpu is not None
+        )
+        seq_lens_max = (
+            int(forward_batch.seq_lens_cpu.max().item())
+            if welm_cpu_prefill
+            else forward_batch.seq_lens.max()
+        )
         if forward_batch.forward_mode.is_target_verify():
             seq_lens_max += self.speculative_num_draft_tokens
         elif (
@@ -1351,7 +1577,11 @@ class AscendAttnBackend(AttentionBackend):
         if forward_batch.extend_seq_lens is not None:
             self.forward_metadata.extend_seq_lens = forward_batch.extend_seq_lens
             self.forward_metadata.extend_seq_lens_cpu_int = (
-                forward_batch.extend_seq_lens.cpu().int()
+                torch.tensor(
+                    forward_batch.extend_seq_lens_cpu, dtype=torch.int32, device="cpu"
+                )
+                if welm_cpu_prefill
+                else forward_batch.extend_seq_lens.cpu().int()
             )
         if forward_batch.seq_lens is not None:
             self.forward_metadata.seq_lens = forward_batch.seq_lens.int()
@@ -1386,7 +1616,9 @@ class AscendAttnBackend(AttentionBackend):
                 self.forward_metadata.seq_lens = (
                     self.forward_metadata.seq_lens + self.speculative_step_id + 1
                 )
-            self._prepare_welm_flash_metadata_inputs(forward_batch)
+            self._prepare_welm_flash_metadata_inputs(
+                forward_batch, pin_memory=welm_cpu_prefill
+            )
 
         self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
         if (
@@ -1484,6 +1716,19 @@ class AscendAttnBackend(AttentionBackend):
                 device=self.device,
             ),
         }
+        if self.capture_welm_decode_metadata:
+            page_starts = (
+                torch.arange(
+                    self.graph_metadata["block_tables"].shape[1],
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                * self.page_size
+            )
+            self.graph_metadata["welm_decode_page_starts"] = page_starts
+            self.graph_metadata["welm_decode_page_in_bounds"] = (
+                page_starts < self.req_to_token.shape[1]
+            )
         if self.is_hybrid_swa:
             self.graph_metadata["block_tables_swa"] = torch.empty(
                 (max_bs, total_context_len // self.page_size),
@@ -1505,7 +1750,7 @@ class AscendAttnBackend(AttentionBackend):
                 total_context_len, device=self.device, dtype=torch.int32
             )
         if self.use_sliding_window_kv_pool:
-            # refilled in place at replay; the captured graph reads this storage
+            # Shared by capture buckets, updated before attention consumes it.
             self.swa_out_cache_loc_buf = torch.zeros(
                 max_num_tokens,
                 dtype=torch.int64,
@@ -1528,9 +1773,13 @@ class AscendAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         seq_lens: torch.Tensor,
         out_cache_loc: Optional[torch.Tensor] = None,
+        *,
+        welm_decode_metadata_in_graph: bool = False,
     ) -> ForwardMetadata:
         """Create and store the per-bs ForwardMetadata for CUDA graph capture."""
-        metadata = ForwardMetadata()
+        metadata = ForwardMetadata(
+            welm_decode_metadata_in_graph=welm_decode_metadata_in_graph
+        )
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
         if self.is_hybrid_swa:
             metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]
@@ -1539,7 +1788,8 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             num_tokens = out_cache_loc.shape[0]
             metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[:num_tokens]
-        metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
+        if not welm_decode_metadata_in_graph:
+            metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         metadata.seq_lens = seq_lens
         if self.is_welm_v4 and forward_mode.is_target_verify():
             # Keep the graph input's pre-verify L intact for WeLM ngram
@@ -1646,7 +1896,7 @@ class AscendAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         out_cache_loc: Optional[torch.Tensor] = None,
     ):
-        """Shared capture+replay body for the cuda-graph init path.
+        """Eager preparation for graph paths without captured decode metadata.
 
         Public entry: :py:meth:`init_forward_metadata_out_graph`.
         """
@@ -4241,7 +4491,26 @@ class AscendAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
+        slopes: Optional[torch.Tensor] = None,
     ):
+        if self.use_welm_flash_attn:
+            # One ragged native Flash call covers prefill and one-Q decode
+            # requests, including mirror consumers and their Full/SWA sinks.
+            # forward_extend owns KV writes; do not write twice here.
+            return self.forward_extend(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                q_rope=q_rope,
+                k_rope=k_rope,
+                topk_indices=topk_indices,
+                sinks=sinks,
+                slopes=slopes,
+            )
         if (
             topk_indices is not None
             or self.use_mla

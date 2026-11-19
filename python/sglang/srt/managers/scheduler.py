@@ -72,6 +72,7 @@ from sglang.srt.disaggregation.decode import (
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
+from sglang.srt.disaggregation.deferred_release import DecodeDeferredReleaseGuard
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
@@ -398,6 +399,8 @@ class Scheduler(
         self.is_initializing = True
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
         self.forward_ct: int = 0
+        # Prefill tokens processed so far; requests snapshot this at waiting_queue entry.
+        self.processed_tokens_counter: int = 0
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         self.init_soft_watchdog(server_args)
 
@@ -1222,7 +1225,20 @@ class Scheduler(
 
         # Configure GC logger
         if envs.SGLANG_LOG_GC.get():
-            configure_gc_logger()
+            pd_diagnostics = None
+            if (
+                get_disagg().disaggregation_mode in ("prefill", "decode")
+                and self.server_args.enable_request_time_stats_logging
+            ):
+                pd_diagnostics = dict(
+                    role=get_disagg().disaggregation_mode,
+                    component="scheduler",
+                    tp_rank=self.ps.attn_tp_rank,
+                    dp_rank=self.ps.attn_dp_rank,
+                    cp_rank=self.ps.attn_cp_rank,
+                    pp_rank=self.ps.pp_rank,
+                )
+            configure_gc_logger(pd_diagnostics=pd_diagnostics)
 
     def init_disaggregation(self):
         self.mm_receiver = None
@@ -1377,6 +1393,28 @@ class Scheduler(
 
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
+        self.pd_deferred_release_guard: Optional[DecodeDeferredReleaseGuard] = None
+        if (
+            _is_npu
+            and getattr(
+                self.model_worker.war_fastpath_runner, "war_required_for_welm", False
+            )
+            and self.enable_overlap
+            and self.spec_algorithm.is_none()
+            and self.ps.pp_size == 1
+            and not self.enable_pdmux
+            and not self.server_args.enable_two_batch_overlap
+            and self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.transfer_backend == TransferBackend.ASCEND
+            and not get_disagg().disaggregation_decode_enable_radix_cache
+            and self.decode_offload_manager is None
+            and not self.enable_hisparse
+            and not self.enable_unified_memory
+            and not self.enable_hierarchical_cache
+            and not self.enable_session_radix_cache
+            and not self.server_args.enable_streaming_session
+        ):
+            self.pd_deferred_release_guard = DecodeDeferredReleaseGuard(self.tree_cache)
 
         # FutureMap is always-on: input_ids relay used in both modes.
         # Workers without the spec_v2_attn_backends override fall back to
@@ -1622,7 +1660,13 @@ class Scheduler(
                 _redraws += 1
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
-        self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+        self._war_barrier_enabled = (
+            is_cuda()
+            or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+            or getattr(
+                self.model_worker.war_fastpath_runner, "war_required_for_welm", False
+            )
+        )
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
 
@@ -1633,11 +1677,11 @@ class Scheduler(
         # forward published after its snapshot (non-spec: decode graph; spec:
         # draft_extend), then clear it. Else whole-forward wait_stream
         # (forceable via SGLANG_FORCE_COARSE_WAR_BARRIER).
-        if not self._war_barrier_enabled:
-            return
         runner = self.model_worker.war_fastpath_runner
         ev = runner.war_fastpath_read_done_event
         runner.war_fastpath_read_done_event = None
+        if not self._war_barrier_enabled:
+            return
         if ev is not None and not envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get():
             self.schedule_stream.wait_event(ev)
         else:
@@ -2055,6 +2099,7 @@ class Scheduler(
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
+            get_pending_release_reqs=self._get_pd_pending_release_reqs,
         )
 
     def init_kv_events_publisher(self) -> None:
@@ -2137,6 +2182,16 @@ class Scheduler(
             ),
             output_streamer=self.output_streamer,
             abort_request=self.abort_request,
+            on_decode_result_ready=(
+                self._on_pd_decode_result_ready
+                if self.pd_deferred_release_guard is not None
+                else None
+            ),
+            maybe_defer_finished_release=(
+                self.pd_deferred_release_guard.defer_if_inflight
+                if self.pd_deferred_release_guard is not None
+                else None
+            ),
         )
 
     def init_req_max_new_tokens(self, req):
@@ -2664,6 +2719,7 @@ class Scheduler(
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
+            req.arrival_processed_tokens = self.processed_tokens_counter
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
@@ -3124,6 +3180,20 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _welm_mixed_decode_kv_tokens(self, running_batch: ScheduleBatch) -> Optional[int]:
+        if not (
+            self.is_mixed_chunk
+            and self.model_config.hf_config.architectures[0] == "WeLMV4MoeForCausalLM"
+        ):
+            return None
+        live_indices = [
+            i for i, req in enumerate(running_batch.reqs) if not req.finished()
+        ]
+        # Empty scheduler placeholder batches do not own an allocator.
+        if not live_indices:
+            return 0
+        return running_batch.new_tokens_required_next_decode(live_indices)
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -3173,7 +3243,11 @@ class Scheduler(
             return None, running_batch
 
         # Get priority queue
-        self.policy.calc_priority(self.waiting_queue, running_batch)
+        self.policy.calc_priority(
+            self.waiting_queue,
+            running_batch,
+            processed_tokens=self.processed_tokens_counter,
+        )
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -3206,10 +3280,17 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            mixed_decode_kv_tokens=self._welm_mixed_decode_kv_tokens(running_batch),
         )
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
+            adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
+                self.chunked_req,
+                self.waiting_queue,
+                adder.rem_chunk_tokens or 0,
+                self.page_size,
+            )
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
@@ -3424,9 +3505,22 @@ class Scheduler(
             return batch
 
         # Check if decode out of memory
-        if (kv_full_retract_flag := not batch.check_decode_mem()) or (
-            TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
+        kv_full_retract_flag = not batch.check_decode_mem()
+        test_retract = TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
+        if (
+            (kv_full_retract_flag or test_retract)
+            and self.pd_deferred_release_guard is not None
+            and self.result_queue
         ):
+            # Retraction needs immediately reclaimable storage. First finish the
+            # existing result(s); do not reset a Req still used by a submitted step.
+            self._drain_pd_inflight_results_for_reclaim()
+            batch.filter_batch()
+            if batch.is_empty():
+                batch.batch_is_full = False
+                return batch
+            kv_full_retract_flag = not batch.check_decode_mem()
+        if kv_full_retract_flag or test_retract:
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio_tracker.current
             mamba_allocator = getattr(
@@ -3569,6 +3663,10 @@ class Scheduler(
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
 
+        # Accumulate the prefill-token counter used by the HRRN scheduling policy.
+        if batch.extend_num_tokens:
+            self.processed_tokens_counter += batch.extend_num_tokens
+
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
 
@@ -3590,6 +3688,10 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
+                # One mailbox per outer scheduler launch. Spec workers may
+                # publish later within the same launch; do not clear it there.
+                war_runner = self.model_worker.war_fastpath_runner
+                war_runner.war_fastpath_read_done_event = None
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
                 self.future_map.resolve_seq_lens_cpu(batch)
@@ -3745,6 +3847,8 @@ class Scheduler(
             else:
                 batch_result.extend_logprob_start_len_per_req = None
 
+            if self.pd_deferred_release_guard is not None:
+                batch_result.pd_resource_step = batch.forward_iter
             ret = batch_result
         else:  # embedding or reward model
             if self.enable_overlap:
@@ -3862,9 +3966,12 @@ class Scheduler(
             else:
                 self.batch_result_processor.process_batch_result_prefill(batch, result)
         elif batch.forward_mode.is_prebuilt():
-            self.batch_result_processor.process_batch_result_prebuilt(batch)
+            self.batch_result_processor.process_batch_result_prebuilt(batch, result)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
+
+        # Submit this batch's queued host backups before the next scheduler step.
+        self.tree_cache.flush_pending_backups()
 
         self._record_step_counters(batch, result)
 
@@ -4011,6 +4118,10 @@ class Scheduler(
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
+            and (
+                self.pd_deferred_release_guard is None
+                or not self.pd_deferred_release_guard.has_pending
+            )
             and self._pp_microbatches_drained()
         )
 
@@ -4497,7 +4608,9 @@ class Scheduler(
             # manipulation logic and the accounting bugs that come with it.
             return
 
-        if self.enable_overlap and self.last_batch:
+        if self.pd_deferred_release_guard is not None:
+            self._drain_pd_inflight_results_for_reclaim()
+        elif self.enable_overlap and self.last_batch:
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)

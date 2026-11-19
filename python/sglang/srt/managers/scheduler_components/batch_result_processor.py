@@ -32,11 +32,13 @@ from sglang.srt.model_executor.forward_batch_info import (
     get_required_capture_hidden_mode,
     get_server_return_hidden_states_mode,
 )
+from sglang.srt.observability.pd_time_stats import emit, request_record
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_memory,
     get_observability,
+    get_parallel,
     get_server_args,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -92,9 +94,28 @@ class SchedulerBatchResultProcessor:
     logprob_result_processor: SchedulerLogprobResultProcessor
     output_streamer: SchedulerOutputStreamer
     abort_request: Callable
+    on_decode_result_ready: Optional[
+        Callable[[ScheduleBatch, GenerationBatchResult], None]
+    ] = None
+    maybe_defer_finished_release: Optional[Callable[[Req, bool], bool]] = None
 
-    def process_batch_result_prebuilt(self, batch: ScheduleBatch):
+    def process_batch_result_prebuilt(
+        self,
+        batch: ScheduleBatch,
+        result: Optional[GenerationBatchResult] = None,
+    ):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
+        # PREBUILT itself has no forward, but may wrap an actual inner IDLE.
+        if (
+            self.on_decode_result_ready is not None
+            and result is not None
+            and result.pd_resource_step is not None
+        ):
+            assert result.copy_done is not None
+            result.copy_done.synchronize()
+            self.token_to_kv_pool_allocator.free_group_begin()
+            self.on_decode_result_ready(batch, result)
+            self.token_to_kv_pool_allocator.free_group_end()
         use_free_group = get_disagg().disaggregation_decode_enable_radix_cache
         if use_free_group:
             self.token_to_kv_pool_allocator.free_group_begin()
@@ -109,6 +130,16 @@ class SchedulerBatchResultProcessor:
 
         # Note: Logprobs should be handled on the prefill engine.
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+        if get_observability().enable_request_time_stats_logging:
+            for req in batch.reqs:
+                emit(
+                    "PDRequestStats ",
+                    request_record(
+                        req,
+                        "prebuilt_output",
+                        tp_rank=get_parallel().attn_tp_rank,
+                    ),
+                )
         if use_free_group:
             self.token_to_kv_pool_allocator.free_group_end()
 
@@ -795,6 +826,11 @@ class SchedulerBatchResultProcessor:
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
+        if self.on_decode_result_ready is not None:
+            self.token_to_kv_pool_allocator.free_group_begin()
+            self.on_decode_result_ready(batch, result)
+            self.token_to_kv_pool_allocator.free_group_end()
+
         self.output_streamer._stream_output_generation(
             batch.reqs, batch.return_logprob, is_idle_batch=True
         )
@@ -840,6 +876,9 @@ class SchedulerBatchResultProcessor:
             )
 
         self.token_to_kv_pool_allocator.free_group_begin()
+
+        if self.on_decode_result_ready is not None:
+            self.on_decode_result_ready(batch, result)
 
         for i, req in enumerate(batch.reqs):
             req: Req
@@ -1055,7 +1094,10 @@ class SchedulerBatchResultProcessor:
                     if get_server_args().enable_mamba_extra_buffer_lazy()
                     else True
                 )
-                release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+                if self.maybe_defer_finished_release is None or not (
+                    self.maybe_defer_finished_release(req, is_insert)
+                ):
+                    release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 
             req.time_stats.set_completion_time()
 

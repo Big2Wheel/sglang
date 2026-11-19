@@ -25,7 +25,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -83,11 +83,12 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.observability.pd_time_stats import emit, identity
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
-from sglang.srt.runtime_context import get_disagg, get_parallel
+from sglang.srt.runtime_context import get_disagg, get_observability, get_parallel
 from sglang.srt.utils import get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
@@ -1798,6 +1799,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.queue.extend(decode_reqs)
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
+        timing = getattr(decode_req.kv_receiver, "pd_timing", None)
+        if timing is not None:
+            timing.mark("commit_begin")
         idx = decode_req.metadata_buffer_index
         (
             output_id,
@@ -1946,6 +1950,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     float(output_token_sampling_logprobs[0].item())
                 )
 
+        if timing is not None:
+            timing.mark("commit_metadata_done")
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
         decode_req.req.time_stats.set_wait_queue_entry_time()
@@ -2113,6 +2119,37 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
 
 class SchedulerDisaggregationDecodeMixin:
+    def _get_pd_pending_release_reqs(self: Scheduler) -> Iterable[Req]:
+        guard = self.pd_deferred_release_guard
+        return guard.iter_pending_reqs() if guard is not None else ()
+
+    def _on_pd_decode_result_ready(
+        self: Scheduler, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> None:
+        # The result processor invokes this only after its copy_done wait.
+        # A freshly created/unrecorded event is not a completion certificate.
+        assert self.pd_deferred_release_guard is not None
+        assert result.pd_resource_step is not None
+        assert result.copy_done is not None and result.delay_sample_func is None
+        self.pd_deferred_release_guard.on_completed(result.pd_resource_step)
+
+    def _pop_and_process_pd_result(self: Scheduler) -> None:
+        tmp_batch, tmp_result = self.result_queue.popleft()
+        self.process_batch_result(tmp_batch, tmp_result)
+        if self.pd_deferred_release_guard is not None and not self.result_queue:
+            # An OOM/pause drain must not leave the outer loop pointing at a
+            # result it already consumed (or accidentally pop the next launch).
+            self.last_batch = None
+
+    def _drain_pd_inflight_results_for_reclaim(self: Scheduler) -> None:
+        # Only call before the next launch, never from a result-ready callback.
+        guard = self.pd_deferred_release_guard
+        assert guard is not None
+        while self.result_queue:
+            self._pop_and_process_pd_result()
+        self.last_batch = None
+        assert guard.completed == guard.latest_submitted and not guard.has_pending
+
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
@@ -2152,11 +2189,10 @@ class SchedulerDisaggregationDecodeMixin:
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
 
-        def pop_and_process():
-            tmp_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(tmp_batch, tmp_result)
-
         while True:
+            if self.gracefully_exit and self.pd_deferred_release_guard is not None:
+                self._drain_pd_inflight_results_for_reclaim()
+                break
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -2180,11 +2216,15 @@ class SchedulerDisaggregationDecodeMixin:
             )
 
             if disable_overlap_for_batch and self.last_batch:
-                pop_and_process()
+                self._pop_and_process_pd_result()
 
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
+                if self.pd_deferred_release_guard is not None:
+                    self.pd_deferred_release_guard.on_submitted(
+                        batch_result.pd_resource_step
+                    )
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
             else:
@@ -2193,8 +2233,10 @@ class SchedulerDisaggregationDecodeMixin:
             # Process the last batch
             if self.last_batch:
                 if not disable_overlap_for_batch:
-                    pop_and_process()
+                    self._pop_and_process_pd_result()
             elif batch is None:
+                if self.pd_deferred_release_guard is not None:
+                    assert not self.pd_deferred_release_guard.has_pending
                 self.on_idle()
 
             # Run sample of the current batch
@@ -2318,6 +2360,9 @@ class SchedulerDisaggregationDecodeMixin:
         return new_batch
 
     def process_decode_queue(self: Scheduler):
+        log_queue = get_observability().enable_request_time_stats_logging
+        if log_queue:
+            queue_enter_ns = time.perf_counter_ns()
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
 
@@ -2338,13 +2383,56 @@ class SchedulerDisaggregationDecodeMixin:
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 
         if self.polling_count % self.polling_interval == 0:
+            if log_queue:
+                prealloc_begin_ns = time.perf_counter_ns()
+                prealloc_count = len(self.disagg_decode_prealloc_queue.queue)
+                transfer_count = len(self.disagg_decode_transfer_queue.queue)
             req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
+            if log_queue:
+                prealloc_end_ns = time.perf_counter_ns()
             self.disagg_decode_transfer_queue.extend(req_conns)
+            if log_queue:
+                poll_begin_ns = time.perf_counter_ns()
             transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
+            if log_queue:
+                poll_end_ns = time.perf_counter_ns()
             if self.enable_hisparse:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
                     self.hisparse_coordinator.admit_request_direct(req)
             self.waiting_queue.extend(transferred_reqs)
+            if log_queue:
+                queue_end_ns = time.perf_counter_ns()
+                if transferred_reqs or queue_end_ns - queue_enter_ns >= 10_000_000:
+                    emit(
+                        "PDDecodeQueueStats ",
+                        identity(
+                            "decode",
+                            None,
+                            tp_rank=self.disagg_decode_transfer_queue.tp_rank,
+                            queue_enter_ns=queue_enter_ns,
+                            prealloc_begin_ns=prealloc_begin_ns,
+                            prealloc_end_ns=prealloc_end_ns,
+                            poll_begin_ns=poll_begin_ns,
+                            poll_end_ns=poll_end_ns,
+                            queue_end_ns=queue_end_ns,
+                            previous_poll_begin_ns=getattr(
+                                self, "_pd_previous_poll_begin_ns", None
+                            ),
+                            previous_poll_end_ns=getattr(
+                                self, "_pd_previous_poll_end_ns", None
+                            ),
+                            prealloc_count=prealloc_count,
+                            transfer_count=transfer_count,
+                            new_transfers=len(req_conns),
+                            completed=[
+                                (req.rid, req.bootstrap_room)
+                                for req in transferred_reqs
+                            ],
+                        ),
+                    )
+                # Constant-size history, including fast polls with no output log.
+                self._pd_previous_poll_begin_ns = poll_begin_ns
+                self._pd_previous_poll_end_ns = poll_end_ns

@@ -25,6 +25,7 @@ class NgramEmbeddingManager:
     table: Optional[torch.Tensor]
     n: int
     k: int
+    welm_mixed_chunk: bool = False
 
     def share_table_from(
         self, owner: "NgramEmbeddingManager"
@@ -58,6 +59,7 @@ class NgramEmbeddingManager:
             table=owner.table,
             n=self.n,
             k=self.k,
+            welm_mixed_chunk=self.welm_mixed_chunk,
         )
 
     def commit_speculative_accepts(
@@ -143,6 +145,11 @@ class NgramEmbeddingManager:
             table=token_table,
             n=ngram_embedding_n,
             k=ngram_embedding_k,
+            welm_mixed_chunk=(
+                is_npu()
+                and server_args.enable_mixed_chunk
+                and model_config.hf_config.architectures[0] == "WeLMV4MoeForCausalLM"
+            ),
         )
 
     def update_after_decode(
@@ -176,12 +183,25 @@ class NgramEmbeddingManager:
         # This mask is valid only for the current forward pass. Rebuild it
         # below when the current batch contains an unfinished chunked request.
         batch.ne_skip_token_table_update = None
-        if batch.forward_mode == ForwardMode.EXTEND:
+        is_welm_mixed = (
+            self.welm_mixed_chunk and batch.forward_mode == ForwardMode.MIXED
+        )
+        if batch.forward_mode == ForwardMode.EXTEND or is_welm_mixed:
+            # Scheduler appends running decode after prefill. Their newest
+            # history is on device (CPU output_ids can lag under overlap), so
+            # never rebuild those rows from prefix_indices/CPU token lists.
+            num_prefill_reqs = len(batch.reqs)
+            history_reqs = batch.reqs
+            history_rows = batch.req_pool_indices
+            if is_welm_mixed:
+                num_prefill_reqs -= len(batch.decoding_reqs or [])
+                history_reqs = batch.reqs[:num_prefill_reqs]
+                history_rows = batch.req_pool_indices[:num_prefill_reqs]
             all_tokens = []
             token_offsets = []
             column_starts = []
             request_lengths = []
-            for req in batch.reqs:
+            for req in history_reqs:
                 start = len(req.prefix_indices)
                 end = start + req.extend_range.length
                 fill_ids = req.origin_input_ids + req.output_ids
@@ -200,11 +220,11 @@ class NgramEmbeddingManager:
                 request_lengths.append(len(tokens))
             dtype = self.table.dtype
             device = self.table.device
-            tokens_tensor = torch.tensor(all_tokens, dtype=dtype, device=device)
-            column_starts_tensor = torch.tensor(
+            tokens_tensor = _history_tensor(all_tokens, dtype=dtype, device=device)
+            column_starts_tensor = _history_tensor(
                 column_starts, dtype=torch.int32, device=device
             )
-            req_lens_tensor = torch.tensor(
+            req_lens_tensor = _history_tensor(
                 request_lengths, dtype=torch.int32, device=device
             )
             if is_npu():
@@ -215,8 +235,8 @@ class NgramEmbeddingManager:
                 welmv4_token_table_ragged_update_npu(
                     self.table,
                     tokens_tensor,
-                    batch.req_pool_indices,
-                    torch.tensor(token_offsets, dtype=torch.int32, device=device),
+                    history_rows,
+                    _history_tensor(token_offsets, dtype=torch.int32, device=device),
                     column_starts_tensor,
                     req_lens_tensor,
                     max_req_len=max(request_lengths, default=0),
@@ -225,7 +245,7 @@ class NgramEmbeddingManager:
                 _update_token_table(
                     ne_token_table=self.table,
                     tokens=tokens_tensor,
-                    row_indices=batch.req_pool_indices,
+                    row_indices=history_rows,
                     column_starts=column_starts_tensor,
                     req_lens=req_lens_tensor,
                     ignore_tokens=None,
@@ -235,9 +255,12 @@ class NgramEmbeddingManager:
             # Use self.chunked_req identity (not req.is_chunked) to avoid
             # overlap-scheduling timing issues.
             if chunked_req is not None:
-                skip_token_table_update = [req is chunked_req for req in batch.reqs]
+                skip_token_table_update = [req is chunked_req for req in history_reqs]
+                skip_token_table_update.extend(
+                    [False] * (len(batch.reqs) - num_prefill_reqs)
+                )
                 batch.ne_skip_token_table_update = (
-                    torch.tensor(
+                    _history_tensor(
                         skip_token_table_update, dtype=torch.bool, device=device
                     )
                     if any(skip_token_table_update)
@@ -286,12 +309,12 @@ class NgramEmbeddingManager:
 
         dtype = self.table.dtype
         device = self.table.device
-        tokens_tensor = torch.tensor(all_tokens, dtype=dtype, device=device)
-        row_indices_tensor = torch.tensor(
+        tokens_tensor = _history_tensor(all_tokens, dtype=dtype, device=device)
+        row_indices_tensor = _history_tensor(
             row_indices, dtype=torch.int64, device=device
         )
         column_starts = torch.zeros(len(reqs), dtype=torch.int32, device=device)
-        req_lens = torch.tensor(request_lengths, dtype=torch.int32, device=device)
+        req_lens = _history_tensor(request_lengths, dtype=torch.int32, device=device)
 
         if is_npu():
             from sglang.srt.layers.welmv4_npu_op import (
@@ -302,7 +325,7 @@ class NgramEmbeddingManager:
                 self.table,
                 tokens_tensor,
                 row_indices_tensor,
-                torch.tensor(token_offsets, dtype=torch.int32, device=device),
+                _history_tensor(token_offsets, dtype=torch.int32, device=device),
                 column_starts,
                 req_lens,
                 max_req_len=max(request_lengths, default=0),
@@ -319,6 +342,19 @@ class NgramEmbeddingManager:
 
         for req in reqs:
             req.ngram_token_table_needs_init = False
+
+
+def _history_tensor(values, *, dtype: torch.dtype, device) -> torch.Tensor:
+    """Stage NPU prefill/PD history without blocking the scheduler CPU."""
+    if not is_npu():
+        return torch.tensor(values, dtype=dtype, device=device)
+    # Use fresh storage: overlap may leave earlier H2D reads in flight. The
+    # NPU pinned allocator tracks the async copy, so the source can go out of
+    # Python scope without being recycled before the transfer completes.
+    host = torch.tensor(values, dtype=dtype, device="cpu", pin_memory=True)
+    # Stay on the caller's stream: H2D -> table update -> the scheduler's
+    # existing forward-stream dependency. No extra stream or host fence.
+    return host.to(device=device, non_blocking=True)
 
 
 def update_ngram_token_table_after_sampling(
