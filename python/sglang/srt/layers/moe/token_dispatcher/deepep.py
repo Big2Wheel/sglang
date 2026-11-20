@@ -20,6 +20,9 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
+from sglang.srt.layers.moe.token_dispatcher.welm_ep_allgather import (
+    active_welm_ep_allgather,
+)
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
@@ -950,6 +953,19 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             and type(strategy).__module__ == "deep_ep.strategies.low_latency_strategy"
             and type(strategy).__name__ == "DefaultLowLatencyCommStrategy"
         )
+        transport = active_welm_ep_allgather()
+        if transport is not None:
+            if not retain_int32 or _use_zbal or self.handle is not None:
+                raise RuntimeError("WeLM AllGather requires the fixed Ascend BF16 LL path")
+            expected_m = (
+                hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
+                + self.num_experts
+            ) // self.num_experts
+            packed, self.packed_recv_count, self.handle = transport.dispatch(
+                self, hidden_states, topk_ids, topk_weights
+            )
+            # This transport's explicit HCCL Work join is already enqueued.
+            return packed, topk_ids, topk_weights, self.packed_recv_count, expected_m, None, None
         if not retain_int32:
             topk_ids = topk_ids.to(torch.int64)
         expected_m = (
@@ -981,7 +997,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         event,
         hook,
     ):
-        hook() if self.return_recv_hook else event.current_stream_wait()
+        if active_welm_ep_allgather() is None:
+            hook() if self.return_recv_hook else event.current_stream_wait()
+        elif event is not None or hook is not None:
+            raise RuntimeError("Unexpected vendor wait in WeLM AllGather dispatch")
 
         get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
             masked_m
@@ -1068,6 +1087,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         return hidden_states, event, hook
 
     def combine_b(self, hidden_states, event, hook):
+        if active_welm_ep_allgather() is not None:
+            if event is not None or hook is not None:
+                raise RuntimeError("Unexpected vendor wait in WeLM AllGather combine")
+            return hidden_states
         overlap_args = self.overlap_args
         if overlap_args is not None:
             overlap_args.stream.wait_stream(self.device_module.current_stream())
@@ -1085,6 +1108,13 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
+        transport = active_welm_ep_allgather()
+        if transport is not None:
+            combined = transport.engine_combine(
+                self, self.handle, hidden_states, topk_ids, topk_weights
+            )
+            self.packed_recv_count = self.handle = None
+            return combined, None, None
         buffer = self._get_buffer()
         overlap_args = self.overlap_args
         meta_overlap_args = self.meta_overlap_args
@@ -1290,6 +1320,9 @@ class DeepEPDispatcher(BaseDispatcher):
             if mode_override is not None
             else self.deepep_mode.resolve(get_is_extend_in_batch())
         )
+        if (active_welm_ep_allgather() is not None
+                and resolved_deepep_mode is not DeepEPMode.LOW_LATENCY):
+            raise RuntimeError("WeLM AllGather is only supported for a fixed Decode LL round")
         if resolved_deepep_mode == DeepEPMode.NORMAL:
             impl = getattr(self, "_normal_dispatcher", None)
         elif resolved_deepep_mode == DeepEPMode.LOW_LATENCY:

@@ -15,6 +15,9 @@ from sglang.srt.utils import get_bool_env_var
 _USE_SIGMOID_NO_RENORM_OUTPUT = get_bool_env_var(
     "SGLANG_NPU_MOE_GATING_TOPK_SIGMOID_NO_RENORM", "false"
 )
+_WELM_FIXED_ROUTER_SHAPE = (1, 512)
+_WELM_FIXED_TOPK = 10
+_SIGMOID_WITH_OPTIONAL_RENORM = 3
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -42,6 +45,7 @@ def fused_expert_bias_topk_npu(
     top_k: int,
     scoring_func: str,
     renormalize: bool,
+    native_router_sigmoid: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run ungrouped expert-bias routing with Ascend MoeGatingTopK.
 
@@ -64,11 +68,27 @@ def fused_expert_bias_topk_npu(
             "expert_bias must be 1D and match the expert dimension, "
             f"got {tuple(expert_bias.shape)} for logits {tuple(router_logits.shape)}"
         )
+    if native_router_sigmoid and (
+        scoring_func != "sigmoid"
+        or renormalize
+        or top_k != _WELM_FIXED_TOPK
+        or router_logits.shape != _WELM_FIXED_ROUTER_SHAPE
+        or router_logits.dtype != torch.float32
+        or expert_bias.dtype != torch.float32
+        or router_logits.device.type != "npu"
+        or router_logits.device != expert_bias.device
+    ):
+        raise ValueError("Native WeLM sigmoid TopK requires fixed FP32 routing without renorm")
 
     # MoeGatingTopK requires x and bias to have the same dtype. WeLM's router
     # and expert bias are FP32, so the casts are normally no-ops.
     logits_fp32 = router_logits.to(torch.float32)
     bias_fp32 = expert_bias.to(device=router_logits.device, dtype=torch.float32)
+    norm_type = (
+        _SIGMOID_WITH_OPTIONAL_RENORM
+        if native_router_sigmoid
+        else int(scoring_func == "sigmoid")
+    )
     op_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
         logits_fp32,
         k=top_k,
@@ -77,7 +97,7 @@ def fused_expert_bias_topk_npu(
         group_count=1,
         group_select_mode=0,
         renorm=1 if renormalize else 0,
-        norm_type=0 if scoring_func == "softmax" else 1,
+        norm_type=norm_type,
         out_flag=False,
         routed_scaling_factor=1.0,
         eps=float(1e-20),
@@ -87,6 +107,7 @@ def fused_expert_bias_topk_npu(
         renormalize
         or scoring_func == "softmax"
         or _USE_SIGMOID_NO_RENORM_OUTPUT
+        or native_router_sigmoid
     ):
         # For softmax, renorm=1 makes the op normalize the selected scores. For
         # sigmoid, the custom MoeGatingTopK extension honors renorm=0 when the
@@ -119,11 +140,14 @@ def fused_topk_npu(
     layer_id: Optional[int] = None,
     expert_bias: Optional[torch.Tensor] = None,
     scoring_func_override: Optional[str] = None,
+    native_router_sigmoid: bool = False,
 ) -> "TopKOutput":
 
     use_grouped_topk = topk_config.use_grouped_topk
     renormalize = topk_config.renormalize
     correction_bias = topk_config.correction_bias
+    if native_router_sigmoid and (expert_bias is None or use_grouped_topk):
+        raise ValueError("Native WeLM sigmoid TopK requires ungrouped expert-bias routing")
 
     # WeLM opt-in path: top-k over (scores + expert_bias); weights from the
     # un-biased scores. This bypasses its custom callback without changing it.
@@ -134,6 +158,7 @@ def fused_topk_npu(
             top_k=topk_config.top_k,
             scoring_func=scoring_func_override or topk_config.scoring_func,
             renormalize=renormalize,
+            native_router_sigmoid=native_router_sigmoid,
         )
 
     # sqrtsoftplus (DSV4 noaux_tc): top-k over (scores + bias); weights from

@@ -74,6 +74,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.layers.welmv4_mk_triton import in_target_native_capture
 from sglang.srt.layers.welmv4_op import (
     WelmV4FusedRMSNorm,
     WelmV4InplaceRotaryEmbedding,
@@ -1143,6 +1144,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         fuse_postmerge_mask: bool = False,
         resolved_moe_tp_group=None,
         resolved_moe_ep_group=None,
+        *,
+        native_router_sigmoid: bool = False,
     ) -> torch.Tensor:
         if allow_inplace_expert_shared_merge and return_components:
             raise RuntimeError(
@@ -1357,6 +1360,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         ),
                         expert_bias=self.expert_bias,
                         scoring_func_override=self.router_score_func,
+                        native_router_sigmoid=native_router_sigmoid,
                     )
                 else:
                     topk_output = self.topk.forward_native(
@@ -3215,7 +3219,34 @@ class Qwen2MoeAttention(nn.Module):
             with device_module.stream(self.alt_stream):
                 gate = self.gate_proj(hidden_states)[0].unsqueeze(-1)
 
-        if fused_qkv is None:
+        write_fixed_decode_kv = (
+            fused_qkv is None
+            and envs.SGLANG_WELMV4_MK_DECODE_KV_PROLOGUE.get()
+            and in_target_native_capture()
+            and not self.is_nextn
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and not forward_batch.is_extend_in_batch
+            and forward_batch.spec_info is None
+            and forward_batch.welm_prefill_graph is None
+        )
+        if write_fixed_decode_kv:
+            # The producer's mirror ranges were published above and the
+            # consumer already selected its raw K/V. Do not rotate raw K
+            # in place (another mirror alias may still refer to it).
+            if self.q_norm is not None or self.k_norm is None or k is None or v is None:
+                raise RuntimeError("Fixed WeLM KV prologue requires raw K/V and K-only RMSNorm")
+            q = get_attn_backend().prepare_welm_fixed_decode_kv(
+                self.attn,
+                forward_batch,
+                q=q,
+                raw_k=k,
+                raw_v=v,
+                gamma=self.k_norm.weight,
+                eps=self.k_norm.eps,
+                positions=positions,
+                cos_sin=self.rotary_emb.cos_sin_cache,
+            )
+        elif fused_qkv is None:
             q_shape = q.shape
             k_shape = None if k is None else k.shape
 
@@ -3341,7 +3372,9 @@ class Qwen2MoeAttention(nn.Module):
                 k,
                 v,
                 forward_batch,
-                save_kv_cache=not frozen_mtp_decode and fused_qkv is None,
+                save_kv_cache=(
+                    not frozen_mtp_decode and fused_qkv is None and not write_fixed_decode_kv
+                ),
                 **attn_kwargs,
             )
         if self.gated_self_attention_headwise:

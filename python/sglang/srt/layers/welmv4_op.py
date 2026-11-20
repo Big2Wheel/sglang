@@ -308,6 +308,7 @@ def _mmq_style_norm_after_attn_tiles(
     WRITE_FP32_OUT: tl.constexpr,  # pylint: disable=invalid-name
     tile_id,
     tile_count,
+    invalid_rows_ptr=None,
 ):
     cols_offsets = tl.arange(0, BLOCK_SIZE)
     mask = cols_offsets < cols
@@ -327,10 +328,15 @@ def _mmq_style_norm_after_attn_tiles(
         hs = onorm_out.to(hs.dtype)
         hs += residual
         rnorm_out, _ = _do_mmq_rms_norm(hs, rnorm_gamma, cols, eps)
+        out = rnorm_out.to(output_dtype)
+        if invalid_rows_ptr is not None:
+            invalid = tl.load(invalid_rows_ptr + row_id)
+            hs = tl.where(invalid, tl.full((BLOCK_SIZE,), 0, hs.dtype), hs)
+            out = tl.where(invalid, tl.full((BLOCK_SIZE,), 0, output_dtype), out)
         tl.store(residual_out_ptr + offsets, hs, mask=mask)
         if WRITE_FP32_OUT:
             tl.store(fp32_out_ptr + offsets, rnorm_out, mask=mask)
-        tl.store(output_ptr + offsets, rnorm_out.to(output_dtype), mask=mask)
+        tl.store(output_ptr + offsets, out, mask=mask)
 
 
 @triton.jit(do_not_specialize=["rows", "tile_id", "tile_count"])
@@ -360,6 +366,33 @@ def mmq_style_norm_after_attn_kernel(
     )
 
 
+@triton.jit(do_not_specialize=["rows", "tile_id", "tile_count"])
+def _mmq_style_norm_after_attn_masked_child(
+    hidden_states_ptr, residual_ptr, onorm_gamma_ptr, rnorm_gamma_ptr,
+    output_ptr, residual_out_ptr, invalid_rows_ptr, rows, cols: tl.constexpr,
+    eps, BLOCK_SIZE: tl.constexpr, tile_id, tile_count,
+):
+    _mmq_style_norm_after_attn_tiles(
+        hidden_states_ptr, residual_ptr, onorm_gamma_ptr, rnorm_gamma_ptr, output_ptr,
+        residual_out_ptr, residual_out_ptr, rows, cols, eps, BLOCK_SIZE, False,
+        tile_id, tile_count, invalid_rows_ptr,
+    )
+
+
+@target_native(_mmq_style_norm_after_attn_masked_child)
+@triton.jit(do_not_specialize=["rows"])
+def mmq_style_norm_after_attn_masked_kernel(
+    hidden_states_ptr, residual_ptr, onorm_gamma_ptr, rnorm_gamma_ptr,
+    output_ptr, residual_out_ptr, invalid_rows_ptr, rows, cols: tl.constexpr,
+    eps, BLOCK_SIZE: tl.constexpr,
+):
+    _mmq_style_norm_after_attn_tiles(
+        hidden_states_ptr, residual_ptr, onorm_gamma_ptr, rnorm_gamma_ptr, output_ptr,
+        residual_out_ptr, residual_out_ptr, rows, cols, eps, BLOCK_SIZE, False,
+        tl.program_id(0), tl.num_programs(0), invalid_rows_ptr,
+    )
+
+
 def mmq_style_norm_after_attn(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
@@ -368,6 +401,7 @@ def mmq_style_norm_after_attn(
     eps: float,
     *,
     return_fp32_out: bool = True,
+    invalid_rows: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     assert hidden_states.dim() == 2
     assert residual.dim() == 2
@@ -389,6 +423,24 @@ def mmq_style_norm_after_attn(
     rows, cols = hidden_states.shape
     num_sms = min(rows, _get_num_sms(multiplier=8))
     block_size = triton.next_power_of_2(cols)
+    if invalid_rows is not None:
+        if (
+            return_fp32_out
+            or rows != 1
+            or hidden_states.dtype != torch.bfloat16
+            or residual.dtype != torch.float32
+            or hidden_states.device.type != "npu"
+            or invalid_rows.shape != (rows,)
+            or invalid_rows.dtype != torch.bool
+            or invalid_rows.device != hidden_states.device
+            or not invalid_rows.is_contiguous()
+        ):
+            raise ValueError("Masked WeLM O-Norm requires fixed NPU BF16/FP32 Decode rows")
+        mmq_style_norm_after_attn_masked_kernel[(num_sms,)](
+            hidden_states, residual, onorm_weight, rnorm_weight, output,
+            residual_out, invalid_rows, rows, cols, eps, block_size,
+        )
+        return output, residual_out, None
     mmq_style_norm_after_attn_kernel[(num_sms,)](
         hidden_states,
         residual,

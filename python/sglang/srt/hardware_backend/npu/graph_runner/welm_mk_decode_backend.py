@@ -1,5 +1,6 @@
 """Model-level WeLM Decode graph; reuse SGLang's fixed buffers and DP shape protocol."""
 
+import json
 import logging
 import os
 from dataclasses import fields
@@ -78,6 +79,68 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
             is_verify or not envs.SGLANG_WELMV4_DECODE_RS_AG.get()
         ):
             raise ValueError("Fixed WeLM MegaKernel Decode requires Decode RS/AG without MTP")
+        self._native_router_sigmoid = envs.SGLANG_WELMV4_MK_DECODE_TOPK_MODE3.get()
+        if self._native_router_sigmoid or envs.SGLANG_WELMV4_MK_DECODE_FLASH_KV_BOUND.get():
+            if (
+                not self.uses_fixed_decode_prologue
+                or not args.enable_dp_attention
+                or args.tp_size != 4
+                or args.dp_size != 4
+                or "950" not in self._device_module.get_device_name(self._device_id)
+            ):
+                raise ValueError("WeLM Decode operator A/B requires fixed Ascend 950 DP4 Decode")
+        self._fuse_pre_moe_mask_norm = (
+            envs.SGLANG_WELMV4_MK_DECODE_PRE_MOE_MASK_NORM.get()
+        )
+        self._mask_norm_layers = (
+            tuple(i for i, layer in enumerate(self._decoder_layers) if layer.self_attn.use_o_norm)
+            if self._fuse_pre_moe_mask_norm else ()
+        )
+        if self._fuse_pre_moe_mask_norm and (
+            not self.uses_fixed_decode_prologue
+            or not args.enable_dp_attention
+            or args.tp_size != 4
+            or args.dp_size != 4
+            or runner.model_runner.ps.moe_ep_size != 4
+            or "950" not in self._device_module.get_device_name(self._device_id)
+            or not self._mask_norm_layers
+        ):
+            raise ValueError("Pre-MoE O-Norm mask requires fixed Ascend 950 DP4 Decode")
+        self._fuse_decode_kv_prologue = envs.SGLANG_WELMV4_MK_DECODE_KV_PROLOGUE.get()
+        if self._fuse_decode_kv_prologue and (
+            not self.uses_fixed_decode_prologue
+            or not args.enable_dp_attention
+            or args.tp_size != 4
+            or args.dp_size != 4
+            or runner.model_runner.ps.moe_ep_size != 4
+            or "950" not in self._device_module.get_device_name(self._device_id)
+            or args.disaggregation_mode != "decode"
+            or args.disaggregation_transfer_backend != "fake"
+        ):
+            raise ValueError("WeLM fused KV prologue requires fixed Ascend 950 DP4EP4 fake Decode")
+        self._ep_allgather_group = None
+        if envs.SGLANG_WELMV4_MK_EP_ALLGATHER.get():
+            if (
+                not self._fuse_decode_kv_prologue
+                or not self._native_router_sigmoid
+                or len(self._mask_norm_layers) != 47
+                or self._layer_count != 48
+                or args.moe_a2a_backend != "deepep"
+                or args.enable_eplb
+                or args.ep_num_redundant_experts
+                or args.enable_two_batch_overlap
+                or args.enable_single_batch_overlap
+                or args.enable_lora
+                or not envs.SGLANG_WELMV4_MK_DECODE_FLASH_KV_BOUND.get()
+                or not envs.SGLANG_WELMV4_MK_DECODE_FLASH_FULL_UNMASKED.get()
+            ):
+                raise ValueError(
+                    "WeLM EP AllGather requires the fixed 48-layer DP4EP4 "
+                    "MegaKernel BF16 Decode configuration with fused KV prologue"
+                )
+            from sglang.srt.distributed.parallel_state import get_moe_ep_group
+
+            self._ep_allgather_group = get_moe_ep_group().device_group
         runner.model_runner.welm_graph_read_done_enabled = False
         self._attn_backend = runner.attn_backend
         self._metadata = {}
@@ -91,17 +154,50 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
     def capture_one(
         self, shape_key, forward_fn, capture_inputs=None, post_warmup_hook=None
     ):
+        if self._ep_allgather_group is None:
+            return self._capture_one(
+                shape_key, forward_fn, capture_inputs, post_warmup_hook, None
+            )
+        if (
+            shape_key.size != 1
+            or shape_key.stream_idx is not None
+            or shape_key.variant_label is not None
+        ):
+            raise ValueError("WeLM EP AllGather requires a fixed single-row capture")
+        from sglang.srt.layers.moe.token_dispatcher.welm_ep_allgather import (
+            welm_ep_allgather_scope,
+        )
+
+        with welm_ep_allgather_scope(
+            True, group=self._ep_allgather_group, expected_layers=self._layer_count
+        ) as ep_scope:
+            return self._capture_one(
+                shape_key, forward_fn, capture_inputs, post_warmup_hook, ep_scope
+            )
+
+    def _capture_one(
+        self, shape_key, forward_fn, capture_inputs, post_warmup_hook, ep_scope
+    ):
         from megakernel._fixed import capture_fixed, prepare_static
         from megakernel._capture_access import _ACTIVE
         from megakernel.ops.tensor_concat import LowerConcats
 
+        scope_options = (
+            {"welm_mask_norm_layers": self._mask_norm_layers} if self._mask_norm_layers else {}
+        )
         # The runner owns and initializes the fixed inputs, attention metadata,
         # scratch KV slots, and DeepEP mode. Capture is entered in the same
         # order on all ranks, including those without local decode requests.
         output_fields = tuple(field.name for field in fields(LogitsProcessorOutput))
 
+        def capture_ep_forward():
+            with ep_scope.forward_pass():
+                return forward_fn()
+
+        capture_forward = forward_fn if ep_scope is None else capture_ep_forward
+
         def capture_outputs():
-            output = forward_fn()
+            output = capture_forward()
             if not isinstance(output, LogitsProcessorOutput):
                 raise TypeError(
                     "Expected WeLM Decode logits at the model graph boundary"
@@ -131,7 +227,7 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
         try:
             # Discover the full/SWA scheduling geometries with the runner's
             # dummy batch, with no active MK recorder.
-            forward_fn()
+            capture_forward()
         finally:
             metadata.welm_mk_schedule_bootstrap = False
         if not metadata.welm_mk_schedule_recipes:
@@ -147,7 +243,7 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
             self._phase,
         )
         with LowerConcats():
-            prepare_static(forward_fn, path)
+            prepare_static(capture_forward, path)
         if post_warmup_hook is not None:
             post_warmup_hook()
         self._device_module.synchronize()
@@ -183,6 +279,17 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
                         path,
                         prepared=True,
                         welm_decode_layers=self._layer_count if page_prologue else 0,
+                        **(
+                            {"welm_native_router_sigmoid": True}
+                            if page_prologue and self._native_router_sigmoid
+                            else {}
+                        ),
+                        **(
+                            {"welm_ep_allgather_group": self._ep_allgather_group}
+                            if ep_scope is not None
+                            else {}
+                        ),
+                        **scope_options,
                     )
             finally:
                 metadata.welm_mk_defer_page_prologue = False
@@ -224,6 +331,29 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
             graph.reset()
             raise RuntimeError(
                 f"WeLM target graph contains unsupported host work: {summary}"
+            )
+        if ep_scope is not None:
+            try:
+                ep_scope.assert_complete()
+                proof = graph.audit_welm_fixed_allgather(ranges)
+                # Hold the fixed-address workspaces through every ACL replay.
+                graph._welm_ep_allgather_owner = ep_scope
+            except Exception:
+                graph.reset()
+                raise
+            logger.info(
+                "welm-mk fixed allgather audited: %s",
+                json.dumps(proof, separators=(",", ":")),
+            )
+        elif self._fuse_decode_kv_prologue:
+            try:
+                fused, scopes, steps = graph.audit_welm_fixed_kv_prologue(ranges)
+            except Exception:
+                graph.reset()
+                raise
+            logger.info(
+                "welm-mk fixed KV prologue audited: layers=%d fused=%d scopes=%d steps=%d",
+                self._layer_count, fused, scopes, steps,
             )
 
         self._graphs[shape_key] = graph

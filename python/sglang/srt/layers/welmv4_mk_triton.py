@@ -8,6 +8,10 @@ from contextvars import ContextVar
 _TARGET_CAPTURE = ContextVar("welmv4_mk_target_capture", default=False)
 
 
+def in_target_native_capture() -> bool:
+    return _TARGET_CAPTURE.get()
+
+
 @contextmanager
 def target_native_capture():
     token = _TARGET_CAPTURE.set(True)

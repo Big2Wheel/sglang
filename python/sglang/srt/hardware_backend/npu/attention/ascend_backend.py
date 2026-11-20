@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch_npu
+from torch.utils._python_dispatch import _disable_current_modes
 from sgl_kernel_npu.attention.sinks_attention import (
     attention_sinks_prefill_triton,
     attention_sinks_triton,
@@ -43,6 +44,89 @@ from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 FULL_ATTENTION_WINDOW = 2147483647
+# ACL's plain row-major layouts. In TorchNPU the format belongs to the
+# storage, not the view: the 5-D FIA backing normally reports NCDHW even
+# through its 4-D per-layer view.
+_ACL_FORMAT_NCHW = 0
+_ACL_FORMAT_ND = 2
+_ACL_FORMAT_NCDHW = 30
+_WELM_PLAIN_KV_FORMATS = (_ACL_FORMAT_NCHW, _ACL_FORMAT_ND, _ACL_FORMAT_NCDHW)
+
+
+def _welm_fixed_kv_layer_view(
+    owner: torch.Tensor,
+    cache: torch.Tensor,
+    local_layer: int,
+    owner_shape: tuple[int, int, int, int, int],
+    *,
+    stage: str,
+) -> tuple[torch.Tensor, int]:
+    """Prove the raw paged store uses exactly the ordinary FIA pool bytes."""
+    layers, pages, page_size, heads, dim = owner_shape
+    token_stride = heads * dim
+    page_stride = page_size * token_stride
+    layer_stride = pages * page_stride
+    expected_offset = local_layer * layer_stride
+    owner_stride = (layer_stride, page_stride, token_stride, dim, 1)
+    if (
+        not 0 <= local_layer < layers
+        or owner.shape != owner_shape
+        or owner.stride() != owner_stride
+        or owner.storage_offset() != 0
+        or owner.dtype != torch.bfloat16
+        or cache.dtype != owner.dtype
+        or cache.device != owner.device
+        or cache.shape != (pages * page_size, 1, heads, dim)
+        or cache.stride() != (token_stride, token_stride, dim, 1)
+        or cache.storage_offset() != expected_offset
+    ):
+        raise RuntimeError(
+            "Fixed WeLM KV prologue requires a canonical FIA cache layer: "
+            f"stage={stage}, layer={local_layer}, owner={tuple(owner.shape)}/{owner.stride()}, "
+            f"view={tuple(cache.shape)}/{cache.stride()}, offset={cache.storage_offset()}"
+        )
+    # MK canonicalizes read-only dispatch arguments. On a metadata query alone
+    # that rebases the layer view to a temporary rank-4 storage descriptor
+    # (NCHW), hiding the real rank-5 owner's NCDHW descriptor. Inspect only
+    # physical metadata outside Torch dispatch modes; never bypass recording
+    # for reshape, the fused store or any other device operation.
+    with _disable_current_modes():
+        owner_format = int(torch_npu.get_npu_format(owner))
+        view_format = int(torch_npu.get_npu_format(cache))
+    if owner_format not in _WELM_PLAIN_KV_FORMATS or view_format != owner_format:
+        raise RuntimeError(
+            "Fixed WeLM KV prologue requires non-padded ND/NCHW/NCDHW storage: "
+            f"stage={stage}, layer={local_layer}, owner format={owner_format}, "
+            f"view format={view_format}"
+        )
+    owner_storage = owner.untyped_storage()
+    cache_storage = cache.untyped_storage()
+    owner_start = owner_storage.data_ptr()
+    element_size = owner.element_size()
+    cache_start = cache.data_ptr()
+    if (
+        owner_start == 0
+        or owner_start != owner.data_ptr()
+        or owner_start != cache_storage.data_ptr()
+        or owner_storage.nbytes() < layers * layer_stride * element_size
+        or cache_start != owner_start + expected_offset * element_size
+        or (expected_offset + layer_stride) * element_size > cache_storage.nbytes()
+    ):
+        raise RuntimeError(
+            "Fixed WeLM KV prologue cache layer does not alias its owning allocation: "
+            f"stage={stage}, layer={local_layer}"
+        )
+    paged = cache.view(pages, page_size, heads, dim)
+    if (
+        paged.data_ptr() != cache_start
+        or paged.storage_offset() != expected_offset
+        or paged.stride() != owner_stride[1:]
+    ):
+        raise RuntimeError(
+            "Fixed WeLM KV prologue page reshape changed the cache layout: "
+            f"stage={stage}, layer={local_layer}"
+        )
+    return paged, owner_format
 
 
 def _load_welm_full_sink_attention_ops():
@@ -704,6 +788,96 @@ class AscendAttnBackend(AttentionBackend):
             cache_mode="Norm",
         )
 
+    def prepare_welm_fixed_decode_kv(
+        self,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        *,
+        q: torch.Tensor,
+        raw_k: torch.Tensor,
+        raw_v: torch.Tensor,
+        gamma: torch.Tensor,
+        eps: float,
+        positions: torch.Tensor,
+        cos_sin: torch.Tensor,
+    ) -> torch.Tensor:
+        """Write the selected BF16 fake Decode pool slot, then let Flash read it."""
+        from .welm_decode_kv_prologue import fused_fixed_decode_kv_prologue
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMHATokenToKVPool
+
+        metadata = self.forward_metadata
+        pool = self.token_to_kv_pool
+        if (
+            not self._use_welm_mk_decode_fast_path()
+            or not self.use_welm_flash_attn
+            or not metadata.welm_decode_metadata_in_graph
+            or self.use_mla
+            or not self.use_fia
+            or not self.is_hybrid_swa
+            or self.page_size != 128
+            or layer.is_cross_attention
+            or not isinstance(pool, SWAKVPool)
+            or pool.layer_transfer_counter is not None
+        ):
+            raise RuntimeError("Fixed WeLM KV prologue requires the existing fake Decode page metadata")
+        layer_id_in_pool, is_swa = pool.layers_mapping[layer.layer_id]
+        inner_pool = pool.swa_kv_pool if is_swa else pool.full_kv_pool
+        slot = metadata.swa_out_cache_loc if is_swa else forward_batch.out_cache_loc
+        if (
+            type(inner_pool) is not NPUMHATokenToKVPool
+            or not inner_pool.use_fia
+            or not inner_pool.use_scatter_pa_kv_cache
+            or inner_pool.is_quantized_kv_cache
+            or inner_pool.post_capture_active
+            or inner_pool.page_size != self.page_size
+            or inner_pool.layer_transfer_counter is not None
+            or inner_pool.dtype != torch.bfloat16
+            or inner_pool.store_dtype != torch.bfloat16
+            or slot is None
+            or slot.dtype != torch.int32
+            or slot.shape != (1,)
+        ):
+            raise RuntimeError("Fixed WeLM KV prologue requires the BF16 ScatterPa NORMAL INT32 slot ABI")
+        key_cache, value_cache = pool.get_kv_buffer(layer.layer_id)
+        key_owner, value_owner = inner_pool.get_hicache_transfer_buffers()
+        local_layer = layer_id_in_pool - inner_pool.start_layer
+        pool_shape = (inner_pool.layer_num, inner_pool.size // self.page_size + 1, self.page_size)
+        stage = (
+            "bootstrap" if metadata.welm_mk_schedule_bootstrap
+            else "record" if metadata.welm_mk_defer_page_prologue
+            else "prepare"
+        )
+        key_cache, key_format = _welm_fixed_kv_layer_view(
+            key_owner, key_cache, local_layer, (*pool_shape, layer.tp_k_head_num, layer.qk_head_dim),
+            stage=stage,
+        )
+        value_cache, value_format = _welm_fixed_kv_layer_view(
+            value_owner, value_cache, local_layer, (*pool_shape, layer.tp_v_head_num, layer.v_head_dim),
+            stage=stage,
+        )
+        seen_pools = getattr(self, "_welm_fixed_kv_logged_pools", None)
+        if seen_pools is None:
+            seen_pools = self._welm_fixed_kv_logged_pools = set()
+        if (stage, is_swa) not in seen_pools and local_layer > 0:
+            logger.info(
+                "Fixed WeLM KV prologue storage: stage=%s bank=%s local_layer=%d "
+                "formats=(%d,%d) owner_shapes=(%s,%s) view_strides=(%s,%s) offsets=(%d,%d)",
+                stage, "SWA" if is_swa else "Full", local_layer, key_format, value_format,
+                tuple(key_owner.shape), tuple(value_owner.shape), key_cache.stride(),
+                value_cache.stride(), key_cache.storage_offset(), value_cache.storage_offset(),
+            )
+            seen_pools.add((stage, is_swa))
+        q_shape = q.shape
+        return fused_fixed_decode_kv_prologue(
+            q.view(1, layer.tp_q_head_num, layer.qk_head_dim),
+            raw_k.view(1, layer.tp_k_head_num, layer.qk_head_dim),
+            raw_v.view(1, layer.tp_v_head_num, layer.v_head_dim),
+            gamma, positions, cos_sin, slot,
+            key_cache,
+            value_cache,
+            eps,
+        ).view(q_shape)
+
     def _forward_welm_flash_attention(
         self,
         q: torch.Tensor,
@@ -715,6 +889,8 @@ class AscendAttnBackend(AttentionBackend):
         mirror_prefill: bool = False,
         graph_metadata: Optional[ForwardMetadata] = None,
         mk_decode: bool = False,
+        use_fixed_decode_kv_bound: bool = False,
+        use_unmasked_full_decode: bool = False,
     ) -> torch.Tensor:
         """Paged Full/SWA attention with native FP32 sinks, eager or graph.
 
@@ -756,6 +932,31 @@ class AscendAttnBackend(AttentionBackend):
             else metadata.block_tables
         )
         is_swa = self._has_layerwise_sliding_window(layer)
+        unmask_full = use_unmasked_full_decode and not is_swa and not self._is_swa_layer(layer)
+        max_kv = -1
+        if use_fixed_decode_kv_bound:
+            # Only select a tiling upper bound. Match it in metadata and the
+            # main op; the original lengths, page indices and window remain.
+            if (
+                max_q != 1
+                or padded_tokens != 1
+                or num_tokens != 1
+                or kv_lens.shape != (1,)
+                or query.dtype != torch.bfloat16
+                or key.dtype != query.dtype
+                or value.dtype != query.dtype
+                or not 0 < self.max_context_len <= block_table.shape[1] * self.page_size
+            ):
+                raise ValueError("Bounded WeLM FlashAttn requires one fixed BF16 Decode row")
+            max_kv = self.max_context_len
+        if unmask_full and (
+            not use_fixed_decode_kv_bound
+            or self.page_size != 128
+            or query.shape[1:] != (24, 256)
+            or key.shape[2:] != (2, 256)
+            or mirror_prefill
+        ):
+            raise ValueError("Unmasked WeLM Full FlashAttn requires probed fixed Decode geometry")
         # The metadata and attention calls must agree on every scheduling
         # attribute. Physical offsets cover all graph rows; used lengths can
         # be zero for padding, whose output is initialized by FlashAttn itself.
@@ -765,8 +966,10 @@ class AscendAttnBackend(AttentionBackend):
             seqused_q=q_lens,
             seqused_kv=kv_lens,
             max_seqlen_q=max_q,
-            max_seqlen_kv=-1,
-            mask_mode=4 if is_swa else 3,
+            max_seqlen_kv=max_kv,
+            # With one Q at the KV tail, the valid KV length already excludes
+            # future positions. Never remove the SWA window or a prefill mask.
+            mask_mode=0 if unmask_full else (4 if is_swa else 3),
             win_left=layer.sliding_window_size if is_swa else -1,
             win_right=0 if is_swa else -1,
             layout_q="TND",
@@ -791,6 +994,15 @@ class AscendAttnBackend(AttentionBackend):
             common["max_seqlen_kv"],
         )
         schedule = metadata.welm_flash_schedules.get(schedule_key)
+        if (
+            use_unmasked_full_decode
+            and metadata.welm_mk_schedule_recipes is not None
+            and metadata.welm_mk_schedule_bootstrap
+        ):
+            logger.info(
+                "WeLM fixed Flash mask schedule: layer=%d mode=%d",
+                layer.layer_id, common["mask_mode"],
+            )
         if schedule is None:
             recipes = metadata.welm_mk_schedule_recipes
             if recipes is not None and not metadata.welm_mk_schedule_bootstrap:
@@ -807,7 +1019,7 @@ class AscendAttnBackend(AttentionBackend):
         launch_kwargs = dict(
             block_table=block_table,
             sinks=sinks.float() if sinks is not None else None,
-            attn_mask=self.welm_flash_attn_mask,
+            attn_mask=None if unmask_full else self.welm_flash_attn_mask,
             metadata=schedule,
             softmax_scale=layer.scaling,
             return_softmax_lse=False,
@@ -3844,12 +4056,26 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
         if self.use_welm_flash_attn:
+            fixed_decode = (
+                self._use_welm_mk_decode_fast_path()
+                and forward_batch.forward_mode.is_decode_or_idle()
+                and forward_batch.spec_info is None
+                and not forward_batch.is_extend_in_batch
+            )
             return self._forward_welm_flash_attention(
                 q,
                 self.token_to_kv_pool.get_key_buffer(layer.layer_id),
                 self.token_to_kv_pool.get_value_buffer(layer.layer_id),
                 layer,
                 sinks,
+                use_fixed_decode_kv_bound=(
+                    envs.SGLANG_WELMV4_MK_DECODE_FLASH_KV_BOUND.get()
+                    and fixed_decode
+                ),
+                use_unmasked_full_decode=(
+                    envs.SGLANG_WELMV4_MK_DECODE_FLASH_FULL_UNMASKED.get()
+                    and fixed_decode
+                ),
             )
 
         if (

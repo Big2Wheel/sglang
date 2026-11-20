@@ -33,6 +33,7 @@ from sglang.srt.layers.dp_attention import (
     welm_dp_segmented_valid_mask,
     welm_reconstruct_attn_scattered_residual_rows,
 )
+from sglang.srt.layers.welmv4_mk_triton import in_target_native_capture
 from sglang.srt.layers.welmv4_op import mmq_style_norm_after_attn
 from sglang.srt.state_capturer.routed_experts import local_dp_route_slot
 from sglang.srt.utils import get_bool_env_var
@@ -495,6 +496,7 @@ class WelmDpLayerState:
     hidden_layout: WelmDpLayout
     residual_layout: Optional[WelmDpLayout]
     row_layout: "WelmDpMoeRowLayout"
+    ll_moe_input_masked: bool = False
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1416,6 +1418,28 @@ class WelmDpAttentionExecutor:
         assert residual is not None
         self._assert_fp32_residual(residual)
         if layer.self_attn.use_o_norm:
+            # This graph owns both outputs and goes directly to LL MoE.
+            # Replay can turn the physical row on or off, so use the live mask.
+            invalid_rows = None
+            if (
+                envs.SGLANG_WELMV4_MK_DECODE_PRE_MOE_MASK_NORM.get()
+                and in_target_native_capture()
+                and envs.SGLANG_WELMV4_MK_DECODE_FAST_PATH.get()
+                and get_bool_env_var("WELM_NPU_USE_MK_TARGET_DECODE")
+                and batch_plan.moe_transport
+                is WelmMoeTransport.DEEPEP_LOW_LATENCY_SCATTERED
+                and plan.role is WelmRunnerRole.TARGET_DP
+                and plan.decode_rs_ag_enabled
+                and plan.attn_tp_size == plan.moe_tp_size == 1
+                and plan.outer_target_dp_size == plan.moe_ep_size == 4
+                and forward_batch.forward_mode.is_decode_or_idle()
+                and forward_batch.spec_info is None
+                and not forward_batch.is_extend_in_batch
+                and attn_output.device.type == "npu"
+                and attn_output.dtype == torch.bfloat16
+                and attn_output.shape[0] == 1
+            ):
+                invalid_rows = welm_dp_attn_scattered_invalid_mask(active_view)
             attn_output, residual, _ = mmq_style_norm_after_attn(
                 attn_output,
                 residual,
@@ -1423,7 +1447,9 @@ class WelmDpAttentionExecutor:
                 layer.post_attention_layernorm.weight,
                 layer.post_attention_layernorm.eps,
                 return_fp32_out=False,
+                invalid_rows=invalid_rows,
             )
+            state.ll_moe_input_masked = invalid_rows is not None
         else:
             attn_output, residual, _ = layer.post_attention_layernorm(
                 attn_output, residual, clone_fp32_out=True
@@ -1672,8 +1698,9 @@ class WelmDpAttentionExecutor:
         )
         invalid_mask = welm_dp_attn_scattered_invalid_mask(active_view)
         assert state.residual is not None
-        state.hidden_states.masked_fill_(invalid_mask[:, None], 0)
-        state.residual.masked_fill_(invalid_mask[:, None], 0)
+        if not state.ll_moe_input_masked:
+            state.hidden_states.masked_fill_(invalid_mask[:, None], 0)
+            state.residual.masked_fill_(invalid_mask[:, None], 0)
 
         fuse_postmerge_mask = (
             envs.SGLANG_WELMV4_MK_DECODE_FAST_PATH.get()
@@ -1689,6 +1716,12 @@ class WelmDpAttentionExecutor:
         # AUTO already resolves this group-wide non-extend round to LL.
         # Retain legal, distinct TopK IDs for dummy rows and zero only their
         # weights; NORMAL's -1 sentinel is not part of the LL contract.
+        native_router_sigmoid = (
+            envs.SGLANG_WELMV4_MK_DECODE_TOPK_MODE3.get()
+            and fuse_postmerge_mask
+            and plan.role is WelmRunnerRole.TARGET_DP
+            and not forward_batch.is_extend_in_batch
+        )
         mlp_output = layer.mlp(
             state.hidden_states,
             None,
@@ -1702,6 +1735,7 @@ class WelmDpAttentionExecutor:
             invalid_topk_id=None,
             allow_inplace_expert_shared_merge=True,
             fuse_postmerge_mask=fuse_postmerge_mask,
+            native_router_sigmoid=native_router_sigmoid,
         )
         state.hidden_states = self._store_final_components(layer, mlp_output)
         if not fuse_postmerge_mask:

@@ -782,6 +782,10 @@ class Envs:
     SGLANG_WELMV4_DECODE_RS_AG = EnvBool(False)
     # Fixed single-row BF16 WeLMV4 MegaKernel Decode on Ascend.
     SGLANG_WELMV4_MK_DECODE_FAST_PATH = EnvBool(False)
+    SGLANG_WELMV4_MK_DECODE_TOPK_MODE3 = EnvBool(False)
+    SGLANG_WELMV4_MK_DECODE_FLASH_KV_BOUND = EnvBool(False)
+    # Experimental: use only actual KV lengths for single-query Full Attention.
+    SGLANG_WELMV4_MK_DECODE_FLASH_FULL_UNMASKED = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_WELMV4_MIRROR_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = (
         EnvInt(None)
@@ -792,6 +796,12 @@ class Envs:
     # MAX_CHUNKS < 2 keeps the existing non-pipeline path.
     SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MIN_CHUNK_TOKENS = EnvInt(1024)
     SGLANG_NPU_PREFILL_OPROJ_RS_PIPELINE_MAX_CHUNKS = EnvInt(0)
+    # Experimental A5 fixed Decode: O-Norm stores zero directly to invalid rows.
+    SGLANG_WELMV4_MK_DECODE_PRE_MOE_MASK_NORM = EnvBool(False)
+    # Experimental A5 fixed BF16 Decode: one device K-norm/RoPE/KV-write node.
+    SGLANG_WELMV4_MK_DECODE_KV_PROLOGUE = EnvBool(False)
+    # Experimental BF16 single-row A5/DP4EP4 MegaKernel Decode transport.
+    SGLANG_WELMV4_MK_EP_ALLGATHER = EnvBool(False)
     # BF16/MXFP8 QKV AG settings apply to Full and, unless overridden, SWA.
     # MIN_CHUNK_TOKENS counts gathered rows; MAX_CHUNKS < 2 disables chunking.
     SGLANG_NPU_PREFILL_AG_FUSED_QKV_MIN_CHUNK_TOKENS = EnvInt(1024)
