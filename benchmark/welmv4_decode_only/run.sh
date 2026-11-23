@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Run inside a four-card npu-run lease. Never assign devices or change CANN here.
+# Run inside a four-card npu-run lease, with a private CANN static-kernel registry.
 set -eo pipefail
 
-mode=${1:?native or megakernel}
-case "$mode" in native|megakernel) ;; *) echo "Unknown mode: $mode" >&2; exit 2;; esac
+mode=${1:?native, megakernel, or megakernel-native}
+case "$mode" in native|megakernel|megakernel-native) ;; *) echo "Unknown mode: $mode" >&2; exit 2;; esac
 out=${2:?output directory}
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
@@ -23,7 +23,7 @@ cann=${CANN_DIR:-/usr/local/Ascend/cann-9.2.1}
 python=${WELM_PYTHON:-python3}
 source "$cann/set_env.sh"
 [[ "$ASCEND_RT_VISIBLE_DEVICES" == "$assigned" ]]
-export PYTHONPATH="$sglang/python:$DEEPEP_PACKAGE_DIR:${PYTHONPATH:-}:$cann/python/site-packages"
+export PYTHONPATH="$sglang/python:$DEEPEP_PACKAGE_DIR:${DEEPEP_PACKAGE_DIR%/*}:${PYTHONPATH:-}:$cann/python/site-packages"
 export LD_LIBRARY_PATH="$DEEPEP_PACKAGE_DIR/vendors/hwcomputing/op_api/lib:${LD_LIBRARY_PATH:-}"
 unset LD_PRELOAD WELM_NPU_USE_MK_TARGET_DECODE WELM_NPU_USE_MK_TARGET_VERIFY WELM_NPU_USE_MK_FLASH_DECODE
 unset WELM_MK_TRITON_CHILDREN
@@ -37,7 +37,13 @@ export SGLANG_DEEPEP_NORMAL_USE_ALLGATHER=1 SGLANG_DEEPEP_NORMAL_USE_ALLTOALL=0
 export SGLANG_NPU_USE_SCATTER_PA_KV_CACHE=1 SGLANG_NPU_WELMV4_FUSED_QKV=0
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=8 DEEPEP_HCCL_BUFFSIZE=2000 DEEP_USE_MODE=default
 export SGLANG_FORCE_COARSE_WAR_BARRIER=1 SGLANG_WELMV4_MK_DECODE_FAST_PATH=0
-if [[ "$mode" == megakernel ]]; then
+execution_args=()
+audit_args=()
+if [[ "$mode" == megakernel-native ]]; then
+    execution_args=(--model-execution-backend megakernel-native)
+    audit_args=(--direct)
+fi
+if [[ "$mode" != native ]]; then
     : "${WELM_MEGAKERNEL_SRC:?MegaKernel checkout containing the WeLM replay changes required}"
     : "${SHMEM_HOME_PATH:?SHMEM install root required}"
     export MEGA_KERNEL_HOME=${MEGA_KERNEL_HOME:-"$WELM_MEGAKERNEL_SRC/output"}
@@ -67,8 +73,13 @@ trap cleanup EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
 
-if [[ "$mode" == megakernel ]]; then
+if [[ "$mode" != native ]]; then
     timeout -k 10 120 env -u LD_PRELOAD "$python" "$here/preflight.py" > "$out/preflight.log" 2>&1
+fi
+pool_args=()
+if [[ -n ${WELM_BENCH_KV_TOKENS:-} ]]; then
+    [[ "$WELM_BENCH_KV_TOKENS" =~ ^[1-9][0-9]+$ ]]
+    pool_args=(--max-total-tokens "$WELM_BENCH_KV_TOKENS")
 fi
 
 timeout -k 10 750 "$python" -u -m sglang.launch_server \
@@ -80,7 +91,8 @@ timeout -k 10 750 "$python" -u -m sglang.launch_server \
     --enable-kv-mirror --chunked-prefill-size 16384 --enable-over-encoding \
     --max-running-requests 32 --swa-full-tokens-ratio 0.8 --disable-swa-chunk-cap --page-size 128 \
     --moe-a2a-backend deepep --deepep-mode auto --enable-cache-report --sampling-backend ascend \
-    --disaggregation-mode decode --disaggregation-transfer-backend fake > "$out/serve.log" 2>&1 &
+    --disaggregation-mode decode --disaggregation-transfer-backend fake \
+    "${pool_args[@]}" "${execution_args[@]}" > "$out/serve.log" 2>&1 &
 server=$!
 for _ in {1..140}; do
     if ! kill -0 "$server" 2>/dev/null; then
@@ -92,8 +104,8 @@ for _ in {1..140}; do
         env -u LD_PRELOAD "$python" "$here/bench.py" --url "$endpoint" --input 16500 --output 150 --rounds 5 \
             | tee "$out/bench.jsonl"
         grep -q 'npu graph: True' "$out/serve.log"
-        if [[ "$mode" == megakernel ]]; then
-            env -u LD_PRELOAD "$python" "$here/audit.py" "$out/serve.log" > "$out/replay-audit.json"
+        if [[ "$mode" != native ]]; then
+            env -u LD_PRELOAD "$python" "$here/audit.py" "${audit_args[@]}" "$out/serve.log" > "$out/replay-audit.json"
         fi
         exit 0
     fi

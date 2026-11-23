@@ -7,20 +7,34 @@ import re
 from pathlib import Path
 
 RANK = re.compile(r"DP(\d+) TP\d+ EP\d+\]")
+ACL_TOPOLOGY = re.compile(r"WeLM fixed ACL graph captured: scopes=(\d+) steps=(\d+)")
+DIRECT_TOPOLOGY = re.compile(
+    r"WeLM MK direct replay: scopes=(\d+) steps=(\d+) acl_graph=False"
+)
 
 
-def audit(log: Path) -> dict:
-    coverage, wrappers, replays = set(), set(), set()
+def audit(log: Path, *, direct: bool = False) -> dict:
+    coverage, replays = set(), set()
+    topology_by_rank = {}
+    expected_backend = "mk-direct" if direct else "acl"
+    expected_topology = DIRECT_TOPOLOGY if direct else ACL_TOPOLOGY
+    forbidden_topology = ACL_TOPOLOGY if direct else DIRECT_TOPOLOGY
     for line in log.read_text(errors="replace").splitlines():
         if "welm-mk-target eager fallback" in line:
             raise RuntimeError(line)
         if not (match := RANK.search(line)):
             continue
         rank = int(match[1])
-        if "WeLM fixed ACL graph captured: scopes=147 steps=1012" in line:
-            if rank in wrappers:
-                raise RuntimeError(f"Duplicate ACL graph on rank {rank}")
-            wrappers.add(rank)
+        if forbidden_topology.search(line):
+            unexpected = "ACL Graph" if direct else "MK direct replay"
+            raise RuntimeError(f"Unexpected {unexpected} on rank {rank}: {line}")
+        if topology := expected_topology.search(line):
+            scopes, steps = map(int, topology.groups())
+            if rank in topology_by_rank or not 0 < scopes <= steps:
+                raise RuntimeError(
+                    f"Invalid {expected_backend} topology on rank {rank}: {line}"
+                )
+            topology_by_rank[rank] = {"scopes": scopes, "steps": steps}
         if "ShapeKey(size=1," not in line:
             continue
         if "welm-mk-target recorded " in line:
@@ -36,15 +50,28 @@ def audit(log: Path) -> dict:
                 raise RuntimeError(f"Incomplete device coverage on rank {rank}")
             coverage.add(rank)
         if "welm-mk-target replay " in line:
+            if (
+                "backend=" in line or direct
+            ) and f"backend={expected_backend}" not in line:
+                raise RuntimeError(f"Unexpected replay backend on rank {rank}: {line}")
             replays.add(rank)
     expected = set(range(4))
-    if not all(ranks == expected for ranks in (coverage, wrappers, replays)):
-        raise RuntimeError(f"Incomplete four-rank run: {coverage=}, {wrappers=}, {replays=}")
-    return {"verified_ranks": sorted(expected), "layers_per_rank": 48, "scopes": 147, "steps": 1012}
+    if coverage != expected or set(topology_by_rank) != expected or replays != expected:
+        mode = "MK direct" if direct else "ACL"
+        raise RuntimeError(
+            f"Incomplete {mode} run: {coverage=}, {topology_by_rank=}, {replays=}"
+        )
+    return {
+        "verified_ranks": sorted(expected),
+        "layers_per_rank": 48,
+        "backend": expected_backend,
+        "topology_by_rank": topology_by_rank,
+    }
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("log", type=Path)
+    parser.add_argument("--direct", action="store_true")
     args = parser.parse_args()
-    print(json.dumps(audit(args.log)))
+    print(json.dumps(audit(args.log, direct=args.direct)))

@@ -65,15 +65,18 @@ def resolve_decode_backend(
     enable_memory_saver = model_runner.server_args.enable_memory_saver
 
     if model_runner.device == "npu":
+        direct_replay = (
+            model_runner.server_args.model_execution_backend == "megakernel-native"
+        )
         if (
-            os.environ.get("WELM_NPU_USE_MK_TARGET_DECODE") == "1"
+            (direct_replay or os.environ.get("WELM_NPU_USE_MK_TARGET_DECODE") == "1")
             and not model_runner.is_draft_worker
         ):
             from sglang.srt.hardware_backend.npu.graph_runner.welm_mk_decode_backend import (
                 WelmMKDecodeBackend,
             )
 
-            return WelmMKDecodeBackend(cuda_graph_runner)
+            return WelmMKDecodeBackend(cuda_graph_runner, direct_replay=direct_replay)
         from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
             NPUCudaGraphBackend,
         )

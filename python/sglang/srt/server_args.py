@@ -584,6 +584,12 @@ class ServerArgs:
         ),
         NS("model"),
     ] = "auto"
+    model_execution_backend: A[
+        Literal["native", "megakernel-native"],
+        "Select WeLMV4 MegaKernel Decode replay without an outer ACL Graph. "
+        "Requires the WeLM fixed Decode configuration.",
+        NS("model"),
+    ] = "native"
     model_config_parser: A[
         str,
         Arg(
@@ -8879,7 +8885,48 @@ class ServerArgs:
                 "(DeepSeek-V4 non-EP DP TBO path)."
             )
 
+    def _validate_megakernel_native(self):
+        if self.model_execution_backend != "megakernel-native":
+            return
+        if (
+            self.device != "npu"
+            or self.cuda_graph_config.decode.backend != Backend.FULL
+        ):
+            raise ValueError(
+                "megakernel-native requires NPU and the full SGLang Decode runner; "
+                "do not disable the Decode graph runner"
+            )
+        if self.enable_torch_compile or self.enable_memory_saver:
+            raise ValueError(
+                "megakernel-native requires uncompiled Decode without memory saver"
+            )
+        if self.speculative_algorithm is not None:
+            raise ValueError("megakernel-native WeLMV4 Decode does not support MTP yet")
+        architectures = self.get_model_config().hf_config.architectures or ()
+        if "WeLMV4MoeForCausalLM" not in architectures:
+            raise ValueError("megakernel-native currently supports only WeLMV4")
+        required = {
+            "WELM_NPU_USE_MK_TARGET_DECODE": os.environ.get(
+                "WELM_NPU_USE_MK_TARGET_DECODE"
+            )
+            == "1",
+            "WELM_NPU_USE_FLASH_ATTN": os.environ.get("WELM_NPU_USE_FLASH_ATTN") == "1",
+            "SGLANG_WELMV4_MK_DECODE_FAST_PATH": envs.SGLANG_WELMV4_MK_DECODE_FAST_PATH.get(),
+            "SGLANG_WELMV4_DECODE_RS_AG": envs.SGLANG_WELMV4_DECODE_RS_AG.get(),
+            # The MK prologue reads shared metadata after the runner's
+            # pre-replay read-done event, so the scheduler must wait for replay.
+            "SGLANG_FORCE_COARSE_WAR_BARRIER": envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get(),
+        }
+        missing = [f"{name}=1" for name, enabled in required.items() if not enabled]
+        if missing:
+            raise ValueError("megakernel-native requires " + ", ".join(missing))
+        if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
+            raise ValueError("megakernel-native requires SGLANG_NPU_USE_MULTI_STREAM=0")
+        if envs.SGLANG_WELMV4_MK_EP_ALLGATHER.get():
+            raise ValueError("WeLM EP AllGather requires the ACL Graph replay backend")
+
     def check_server_args(self):
+        self._validate_megakernel_native()
         # Check parallel size constraints
         if self.ep_join_mode != "scale":
             assert (

@@ -104,7 +104,8 @@ class TestBackendWiring(unittest.TestCase):
         metadata = NS(welm_decode_metadata_in_graph=True, seq_lens=batch.seq_lens)
         key = Shape(1)
         backend.__dict__.update(
-            _ep_allgather_group=group, _layer_count=1, _decoder_layers=(layer,),
+            _direct_replay=False, _ep_allgather_group=group, _layer_count=1,
+            _decoder_layers=(layer,),
             _mask_norm_layers=(0,), _native_router_sigmoid=True, _phase="DECODE",
             _fuse_decode_kv_prologue=True, _graphs={}, _outputs={}, _metadata={},
             _page_prologue_batches={}, _replays={}, uses_fixed_decode_prologue=True,

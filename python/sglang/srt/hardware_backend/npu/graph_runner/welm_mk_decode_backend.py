@@ -3,13 +3,13 @@
 import json
 import logging
 import os
-from dataclasses import fields
-from pathlib import Path
 import shutil
 import tempfile
+from contextlib import contextmanager
+from dataclasses import fields
+from pathlib import Path
 
 import torch
-
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
     NPUCudaGraphBackend,
@@ -24,8 +24,9 @@ logger = logging.getLogger(__name__)
 class WelmMKDecodeBackend(NPUCudaGraphBackend):
     """Substitute the executor, not the collective shape selection or KV pool."""
 
-    def __init__(self, runner):
+    def __init__(self, runner, *, direct_replay=False):
         super().__init__(runner)
+        self._direct_replay = direct_replay
         args = runner.model_runner.server_args
         architectures = runner.model_runner.model_config.hf_config.architectures or []
         if (
@@ -42,6 +43,8 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
                 "Model-level MegaKernel does not support multiple decode streams"
             )
         is_verify = not runner.model_runner.spec_algorithm.is_none()
+        if direct_replay and is_verify:
+            raise ValueError("Direct WeLM MegaKernel replay requires Decode without MTP")
         if is_verify and not (
             os.environ.get("WELM_NPU_USE_MK_TARGET_VERIFY") == "1"
             and runner.capture_forward_mode.is_target_verify()
@@ -75,6 +78,8 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
         # NpuGraphReadDone's flag handshake belongs to torch.npu.NPUGraph.
         # Keep the scheduler WAR barrier, with its whole-forward wait fallback.
         self.uses_fixed_decode_prologue = envs.SGLANG_WELMV4_MK_DECODE_FAST_PATH.get()
+        if direct_replay and not self.uses_fixed_decode_prologue:
+            raise ValueError("Direct WeLM MegaKernel replay requires fixed Decode metadata")
         if self.uses_fixed_decode_prologue and (
             is_verify or not envs.SGLANG_WELMV4_DECODE_RS_AG.get()
         ):
@@ -120,6 +125,8 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
             raise ValueError("WeLM fused KV prologue requires fixed Ascend 950 DP4EP4 fake Decode")
         self._ep_allgather_group = None
         if envs.SGLANG_WELMV4_MK_EP_ALLGATHER.get():
+            if direct_replay:
+                raise ValueError("WeLM EP AllGather requires the ACL Graph replay backend")
             if (
                 not self._fuse_decode_kv_prologue
                 or not self._native_router_sigmoid
@@ -147,6 +154,20 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
         self._page_prologue_batches = {}
         self._replays = {}
         self._ineligible_shapes = set()
+
+    @contextmanager
+    def capture_session(self, stream):
+        if not self._direct_replay:
+            with super().capture_session(stream):
+                yield
+            return
+        # SGLang still owns the capture stream and shape buckets. MK owns
+        # its allocations; there is no Torch graph pool in direct mode.
+        self._capture_stream = stream
+        try:
+            yield
+        finally:
+            self._capture_stream = None
 
     # Keep reusable schedule buffers mutable from the scheduler's replay path.
     @torch.no_grad()
@@ -178,8 +199,8 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
     def _capture_one(
         self, shape_key, forward_fn, capture_inputs, post_warmup_hook, ep_scope
     ):
-        from megakernel._fixed import capture_fixed, prepare_static
         from megakernel._capture_access import _ACTIVE
+        from megakernel._fixed import capture_fixed, prepare_static
         from megakernel.ops.tensor_concat import LowerConcats
 
         scope_options = (
@@ -270,8 +291,8 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
         try:
             try:
                 # The native dummy warmup above populated the stable metadata
-                # buffers. Exclude only the producers from this inner recorder:
-                # the outer ACL graph records them before every model replay.
+                # buffers. Exclude only the producers from the MK recorder:
+                # replay enqueues them before the model, via ACL or directly.
                 metadata.welm_mk_defer_page_prologue = page_prologue
                 with LowerConcats():
                     graph = capture_fixed(
@@ -302,6 +323,9 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
                 for artifact in path.glob("capture_failure_*.json"):
                     shutil.copy2(artifact, dest / artifact.name)
             raise
+        if self._direct_replay and not callable(getattr(graph, "replay_direct", None)):
+            graph.reset()
+            raise RuntimeError("Rebuild MegaKernel with WeLM direct replay support")
         summary = graph.execution_summary
         fused_indices = {index for plan in graph.plans for index in plan.task_indices}
         layer_launches = {
@@ -382,17 +406,26 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
                     updated = self._attn_backend._welm_flash_attn_metadata(*dims, **common)
                     metadata.welm_flash_schedules[key].copy_(updated, non_blocking=True)
 
-        if captured_inputs is None:
+        if captured_inputs is None and not self._direct_replay:
             update_metadata()
         with profile_range("welm.mk.replay"):
-            if captured_inputs is None:
+            if self._direct_replay:
+                # The MK replay lock and stream ordering cover both metadata
+                # producers and submission of the prepared device sequence.
+                graph.replay_direct(before_launch=update_metadata)
+            elif captured_inputs is None:
                 graph.replay()
             else:
                 graph.replay(before_acl_capture=update_metadata)
         count = self._replays[shape_key] + 1
         self._replays[shape_key] = count
         if count <= 3 or count % 128 == 0:
-            logger.info("welm-mk-target replay shape=%s count=%s", shape_key, count)
+            logger.info(
+                "welm-mk-target replay shape=%s count=%s backend=%s",
+                shape_key,
+                count,
+                "mk-direct" if self._direct_replay else "acl",
+            )
         return self._outputs[shape_key]
 
     def replay_with_input_update(self, *args, **kwargs):
