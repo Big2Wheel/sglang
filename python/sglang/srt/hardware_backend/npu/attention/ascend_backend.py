@@ -148,6 +148,9 @@ class ForwardMetadata:
     # Read-only schedules shared by equal attention geometries in this forward.
     # Each graph bucket owns its capture outputs; never share across forwards.
     welm_flash_schedules: dict[tuple, torch.Tensor] = field(default_factory=dict)
+    # MegaKernel reuses these schedule buffers; producers run before replay.
+    welm_mk_schedule_recipes: Optional[dict] = None
+    welm_mk_schedule_bootstrap: bool = False
     # Ordinary prefill consumers use one Q per request, unlike source layers.
     welm_flash_mirror_q_lengths: Optional[tuple[torch.Tensor, torch.Tensor]] = None
 
@@ -466,6 +469,7 @@ class AscendAttnBackend(AttentionBackend):
         # Speculative/draft and other attention paths retain eager preparation.
         self.capture_welm_decode_metadata = (
             self.use_welm_flash_attn
+            and model_runner.server_args.model_execution_backend != "megakernel-native"
             and model_runner.spec_algorithm.is_none()
             and not model_runner.is_draft_worker
             and not self.is_dllm_model
@@ -785,13 +789,20 @@ class AscendAttnBackend(AttentionBackend):
         )
         schedule = metadata.welm_flash_schedules.get(schedule_key)
         if schedule is None:
-            schedule = self._welm_flash_attn_metadata(
+            recipes = metadata.welm_mk_schedule_recipes
+            if recipes is not None and not metadata.welm_mk_schedule_bootstrap:
+                raise RuntimeError(
+                    "MegaKernel Decode needs a prepared FlashAttn schedule"
+                )
+            dimensions = (
                 layer.tp_q_head_num,
                 layer.tp_k_head_num,
                 layer.qk_head_dim,
-                **common,
             )
+            schedule = self._welm_flash_attn_metadata(*dimensions, **common)
             metadata.welm_flash_schedules[schedule_key] = schedule
+            if recipes is not None:
+                recipes[schedule_key] = (dimensions, common)
         output, _ = self._welm_flash_attn(
             query,
             key,
@@ -1464,9 +1475,15 @@ class AscendAttnBackend(AttentionBackend):
             self._prepare_welm_decode_metadata_device(forward_batch)
         if self.use_welm_flash_attn:
             # run_once invokes this for each warmup AND the actual capture.
-            # Capture must record fresh producers, not reuse warmup schedules.
-            self.forward_metadata.welm_flash_schedules.clear()
-            self.forward_metadata.welm_flash_mirror_q_lengths = None
+            # Ordinary graphs record the producers. MegaKernel records only
+            # their consumers and refreshes the same device buffers at replay.
+            metadata = self.forward_metadata
+            if (
+                metadata.welm_mk_schedule_recipes is None
+                or metadata.welm_mk_schedule_bootstrap
+            ):
+                metadata.welm_flash_schedules.clear()
+            metadata.welm_flash_mirror_q_lengths = None
 
     def _prepare_welm_decode_metadata_device(
         self, forward_batch: ForwardBatch

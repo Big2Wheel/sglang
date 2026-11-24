@@ -569,6 +569,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     def can_run_graph(self, forward_batch: ForwardBatch):
+        supported = self._can_run_graph(forward_batch)
+        if (
+            not supported
+            and self.model_runner.server_args.model_execution_backend
+            == "megakernel-native"
+            and forward_batch.forward_mode.is_decode_or_idle()
+        ):
+            raise RuntimeError(
+                "Decode batch is not eligible for megakernel-native replay; "
+                "this baseline requires single-row Decode"
+            )
+        return supported
+
+    def _can_run_graph(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False

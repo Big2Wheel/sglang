@@ -584,6 +584,11 @@ class ServerArgs:
         ),
         NS("model"),
     ] = "auto"
+    model_execution_backend: A[
+        Literal["native", "megakernel-native"],
+        "Use MegaKernel for WeLMV4 Decode without an outer ACL Graph.",
+        NS("model"),
+    ] = "native"
     model_config_parser: A[
         str,
         Arg(
@@ -8879,7 +8884,48 @@ class ServerArgs:
                 "(DeepSeek-V4 non-EP DP TBO path)."
             )
 
+    def _validate_megakernel_native(self):
+        if self.model_execution_backend != "megakernel-native":
+            return
+
+        decode = self.cuda_graph_config.decode
+        if self.device != "npu" or decode.backend != Backend.FULL:
+            raise ValueError("megakernel-native requires NPU and the full Decode runner")
+        if decode.bs != [1]:
+            raise ValueError("megakernel-native requires --cuda-graph-max-bs-decode 1")
+        if self.speculative_algorithm is not None:
+            raise ValueError("megakernel-native does not support speculative decoding")
+        if (
+            self.enable_pdmux
+            or self.enable_two_batch_overlap
+            or self.enable_single_batch_overlap
+            or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            or envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get()
+        ):
+            raise ValueError("megakernel-native requires single-stream Decode without PDMux")
+        if (
+            self.enable_torch_compile
+            or self.enable_memory_saver
+            or self.enable_lora
+            or self.pp_size != 1
+        ):
+            raise ValueError(
+                "megakernel-native requires PP=1 without torch.compile, memory saver, or LoRA"
+            )
+        architectures = self.get_model_config().hf_config.architectures or []
+        if "WeLMV4MoeForCausalLM" not in architectures:
+            raise ValueError("megakernel-native supports only the main WeLMV4 model")
+        if self.get_attention_backends()[1] != "ascend" or os.environ.get(
+            "WELM_NPU_USE_FLASH_ATTN"
+        ) != "1":
+            raise ValueError(
+                "megakernel-native requires Ascend Decode attention and WELM_NPU_USE_FLASH_ATTN=1"
+            )
+        if os.environ.get("MK_FIXED_REPLAY_TRITON_GLOBALS") != "1":
+            raise ValueError("megakernel-native requires MK_FIXED_REPLAY_TRITON_GLOBALS=1")
+
     def check_server_args(self):
+        self._validate_megakernel_native()
         # Check parallel size constraints
         if self.ep_join_mode != "scale":
             assert (

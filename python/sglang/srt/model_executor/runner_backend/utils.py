@@ -54,8 +54,7 @@ def resolve_decode_backend(
 ) -> BaseCudaGraphBackend:
     """Pick a backend instance from cuda_graph_config['decode']['backend'].
 
-    NPU device returns NPUCudaGraphBackend regardless of mode (only
-    the Full-style backend is wired for NPU today).
+    On NPU, use the native backend unless WeLM MegaKernel is explicitly selected.
     """
     model_runner = cuda_graph_runner.model_runner
     cfg = model_runner.server_args.cuda_graph_config
@@ -64,6 +63,12 @@ def resolve_decode_backend(
     enable_memory_saver = model_runner.server_args.enable_memory_saver
 
     if model_runner.device == "npu":
+        if model_runner.server_args.model_execution_backend == "megakernel-native":
+            from sglang.srt.hardware_backend.npu.graph_runner.welm_mk_decode_backend import (
+                WelmMKDecodeBackend,
+            )
+
+            return WelmMKDecodeBackend(cuda_graph_runner)
         from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
             NPUCudaGraphBackend,
         )
