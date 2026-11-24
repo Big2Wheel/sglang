@@ -229,6 +229,8 @@ class ForwardMetadata:
 
     # Fixed at capture time: replay must use the same metadata preparation path.
     welm_decode_metadata_in_graph: bool = False
+    # Multi-row MK Decode routes padded writes to distinct reserved slots.
+    welm_mk_full_out_cache_loc: Optional[torch.Tensor] = None
 
     # Read-only schedules shared by equal attention geometries in this forward.
     # Each graph bucket owns its capture outputs; never share across forwards.
@@ -1725,7 +1727,7 @@ class AscendAttnBackend(AttentionBackend):
         """Capture ordinary decode metadata from fixed registry input buffers."""
         metadata = self.forward_metadata
         seq_lens = forward_batch.seq_lens
-        if self._use_welm_mk_decode_fast_path():
+        if self._use_welm_mk_decode_fast_path() and seq_lens.shape == (1,):
             from .welm_decode_page_prologue import prepare_page_prologue
 
             prepare_page_prologue(
@@ -1752,7 +1754,22 @@ class AscendAttnBackend(AttentionBackend):
             self.graph_metadata["welm_decode_page_in_bounds"],
         )
 
-        if metadata.swa_out_cache_loc is not None:
+        if metadata.welm_mk_full_out_cache_loc is not None:
+            # Both paged allocators leave page zero out of their free lists.
+            # Give each padded row an independent destination in that page;
+            # neither negative slots nor duplicate writes are needed.
+            dummy = self.graph_metadata["welm_mk_decode_dummy_slots"][: seq_lens.shape[0]]
+            full_write_locs = metadata.welm_mk_full_out_cache_loc
+            full_write_locs.copy_(
+                torch.where(valid_rows, forward_batch.out_cache_loc, dummy)
+            )
+            swa_write_locs = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                full_write_locs
+            )
+            metadata.swa_out_cache_loc.copy_(
+                torch.where(valid_rows, swa_write_locs, dummy)
+            )
+        elif metadata.swa_out_cache_loc is not None:
             full_write_locs = torch.where(valid_rows, forward_batch.out_cache_loc, 0)
             swa_write_locs = self.token_to_kv_pool.translate_loc_from_full_to_swa(
                 full_write_locs
@@ -1997,6 +2014,7 @@ class AscendAttnBackend(AttentionBackend):
             location_dtype = torch.int64
             if self._use_welm_mk_decode_fast_path():
                 pool = getattr(self.token_to_kv_pool, "swa_kv_pool", None)
+                int32_max = torch.iinfo(torch.int32).max
                 if (
                     not (
                         self.is_welm_v4
@@ -2007,13 +2025,36 @@ class AscendAttnBackend(AttentionBackend):
                     or self.use_mla
                     or self.model_dtype != torch.bfloat16
                     or self.speculative_num_draft_tokens not in (None, 0)
-                    or max_bs != 1
-                    or max_num_tokens != 1
+                    or max_bs < 1
+                    or max_num_tokens != max_bs
                     or pool is None
                     or not getattr(pool, "use_scatter_pa_kv_cache", False)
-                    or not 0 < pool.size + self.page_size <= torch.iinfo(torch.int32).max
+                    or not 0 < pool.size + self.page_size <= int32_max
                 ):
                     raise RuntimeError("INT32 SWA requires the fixed WeLM ScatterPa Decode ABI")
+                if max_bs > 1:
+                    full_pool = getattr(self.token_to_kv_pool, "full_kv_pool", None)
+                    if (
+                        max_bs >= self.page_size
+                        or not isinstance(self.token_to_kv_pool, SWAKVPool)
+                        or full_pool is None
+                        or any(
+                            not kv_pool.use_fia
+                            or not kv_pool.use_scatter_pa_kv_cache
+                            or kv_pool.page_size != self.page_size
+                            or kv_pool.dtype != torch.bfloat16
+                            or kv_pool.store_dtype != torch.bfloat16
+                            or not 0 < kv_pool.size + self.page_size <= int32_max
+                            for kv_pool in (full_pool, pool)
+                        )
+                    ):
+                        raise RuntimeError(
+                            "Multi-row WeLM MK Decode requires INT32 ScatterPa "
+                            "and distinct padding slots in page zero of both pools"
+                        )
+                    self.graph_metadata["welm_mk_decode_dummy_slots"] = torch.arange(
+                        1, max_bs + 1, dtype=torch.int32, device=self.device
+                    )
                 # The existing metadata copy handles this conversion once.
                 # Every layer then reads the same INT32 device allocation.
                 location_dtype = torch.int32
@@ -2054,6 +2095,18 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             num_tokens = out_cache_loc.shape[0]
             metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[:num_tokens]
+            if (
+                welm_decode_metadata_in_graph
+                and bs > 1
+                and self._use_welm_mk_decode_fast_path()
+            ):
+                if out_cache_loc.shape != (bs,):
+                    raise RuntimeError(
+                        "Multi-row WeLM MK Decode requires one KV slot per row"
+                    )
+                metadata.welm_mk_full_out_cache_loc = torch.empty_like(
+                    out_cache_loc, dtype=torch.int32
+                )
         if not welm_decode_metadata_in_graph:
             metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         metadata.seq_lens = seq_lens
@@ -4044,10 +4097,11 @@ class AscendAttnBackend(AttentionBackend):
                     layer, forward_batch.out_cache_loc, k, k_rope
                 )
             else:
+                full_loc = self.forward_metadata.welm_mk_full_out_cache_loc
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
                     KVWriteLoc(
-                        forward_batch.out_cache_loc,
+                        forward_batch.out_cache_loc if full_loc is None else full_loc,
                         self.forward_metadata.swa_out_cache_loc,
                     ),
                     k,
@@ -4058,6 +4112,7 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_welm_flash_attn:
             fixed_decode = (
                 self._use_welm_mk_decode_fast_path()
+                and forward_batch.batch_size == 1
                 and forward_batch.forward_mode.is_decode_or_idle()
                 and forward_batch.spec_info is None
                 and not forward_batch.is_extend_in_batch

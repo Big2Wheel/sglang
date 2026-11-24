@@ -203,9 +203,20 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
         from megakernel._fixed import capture_fixed, prepare_static
         from megakernel.ops.tensor_concat import LowerConcats
 
-        scope_options = (
-            {"welm_mask_norm_layers": self._mask_norm_layers} if self._mask_norm_layers else {}
-        )
+        bucket = shape_key.size
+        single_row = bucket == 1
+        if self.uses_fixed_decode_prologue and not single_row and (
+            not self._direct_replay or bucket not in (2, 4, 8)
+        ):
+            raise ValueError(
+                "Multi-row WeLM MegaKernel Decode requires direct replay "
+                "and a capture bucket of 2, 4, or 8"
+            )
+        scope_options = {}
+        if single_row and self._mask_norm_layers:
+            scope_options["welm_mask_norm_layers"] = self._mask_norm_layers
+        if self.uses_fixed_decode_prologue and not single_row:
+            scope_options["welm_decode_batch_size"] = bucket
         # The runner owns and initializes the fixed inputs, attention metadata,
         # scratch KV slots, and DeepEP mode. Capture is entered in the same
         # order on all ranks, including those without local decode requests.
@@ -237,12 +248,12 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
             or capture_inputs is None
             or not capture_inputs.forward_mode.is_decode_or_idle()
             or capture_inputs.spec_info is not None
-            or capture_inputs.seq_lens.shape != (1,)
+            or capture_inputs.seq_lens.shape != (bucket,)
             or capture_inputs.out_cache_loc is None
-            or capture_inputs.out_cache_loc.shape != (1,)
+            or capture_inputs.out_cache_loc.shape != (bucket,)
             or metadata.seq_lens is not capture_inputs.seq_lens
         ):
-            raise RuntimeError("Device page prologue requires an ordinary, fixed single-row Decode capture")
+            raise RuntimeError("Device page prologue requires ordinary, fixed Decode inputs")
         metadata.welm_mk_schedule_recipes = {}
         metadata.welm_mk_schedule_bootstrap = True
         try:
@@ -302,7 +313,7 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
                         welm_decode_layers=self._layer_count if page_prologue else 0,
                         **(
                             {"welm_native_router_sigmoid": True}
-                            if page_prologue and self._native_router_sigmoid
+                            if page_prologue and single_row and self._native_router_sigmoid
                             else {}
                         ),
                         **(
@@ -369,7 +380,7 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
                 "welm-mk fixed allgather audited: %s",
                 json.dumps(proof, separators=(",", ":")),
             )
-        elif self._fuse_decode_kv_prologue:
+        elif single_row and self._fuse_decode_kv_prologue:
             try:
                 fused, scopes, steps = graph.audit_welm_fixed_kv_prologue(ranges)
             except Exception:
@@ -404,7 +415,20 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
             with profile_range("welm.mk.attn_metadata"):
                 for key, (dims, common) in metadata.welm_mk_schedule_recipes.items():
                     updated = self._attn_backend._welm_flash_attn_metadata(*dims, **common)
-                    metadata.welm_flash_schedules[key].copy_(updated, non_blocking=True)
+                    recorded = metadata.welm_flash_schedules[key]
+                    if captured_inputs is not None and shape_key.size > 1 and (
+                        updated.shape != recorded.shape
+                        or updated.dtype != recorded.dtype
+                        or updated.device != recorded.device
+                    ):
+                        # copy_ could otherwise silently broadcast or cast a
+                        # CANN schedule with a changed replay layout.
+                        raise RuntimeError(
+                            f"WeLM FlashAttn schedule layout changed for {shape_key}: "
+                            f"recorded={(recorded.shape, recorded.dtype, recorded.device)}, "
+                            f"updated={(updated.shape, updated.dtype, updated.device)}"
+                        )
+                    recorded.copy_(updated, non_blocking=True)
 
         if captured_inputs is None and not self._direct_replay:
             update_metadata()

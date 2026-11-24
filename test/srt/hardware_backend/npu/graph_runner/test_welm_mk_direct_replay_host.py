@@ -6,12 +6,17 @@ import unittest
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
+from typing import NamedTuple
 from unittest.mock import Mock
 
 BACKEND = (
     Path(__file__).resolve().parents[5]
     / "python/sglang/srt/hardware_backend/npu/graph_runner/welm_mk_decode_backend.py"
 )
+
+
+class ShapeKey(NamedTuple):
+    size: int
 
 
 class ACLBackend:
@@ -47,7 +52,7 @@ def replay_backend():
 class TestDirectReplay(unittest.TestCase):
     def setUp(self):
         self.backend = replay_backend()
-        self.key = "bs1"
+        self.key = ShapeKey(1)
         self.batch = object()
         self.output = object()
         self.trace = []
@@ -119,6 +124,34 @@ class TestDirectReplay(unittest.TestCase):
             self.backend.replay(self.key, self.batch)
         self.assertEqual(self.trace, ["pages"])
         self.assertEqual(self.backend._replays[self.key], 0)
+        self.graph.replay.assert_not_called()
+
+    def test_multi_row_schedule_cannot_broadcast_into_recorded_layout(self):
+        key = ShapeKey(2)
+        for mapping in (
+            self.backend._graphs,
+            self.backend._outputs,
+            self.backend._metadata,
+            self.backend._page_prologue_batches,
+            self.backend._replays,
+        ):
+            mapping[key] = mapping.pop(self.key)
+        recorded = SimpleNamespace(
+            shape=(2, 12), dtype="int32", device="npu:0", copy_=Mock()
+        )
+        self.metadata.welm_flash_schedules["flash"] = recorded
+        valid = SimpleNamespace(shape=(2, 12), dtype="int32", device="npu:0")
+        would_broadcast = SimpleNamespace(shape=(1, 12), dtype="int32", device="npu:0")
+        self.backend._attn_backend._welm_flash_attn_metadata.side_effect = [
+            valid,
+            would_broadcast,
+        ]
+        self.assertIs(self.backend.replay(key, self.batch), self.output)
+        with self.assertRaisesRegex(RuntimeError, "FlashAttn schedule layout changed"):
+            self.backend.replay(key, self.batch)
+        recorded.copy_.assert_called_once_with(valid, non_blocking=True)
+        self.assertEqual(self.backend._replays[key], 1)
+        self.assertEqual(self.trace, ["pages", "mk-direct", "pages"])
         self.graph.replay.assert_not_called()
 
     def test_acl_path_still_uses_acl_pool_and_callback(self):

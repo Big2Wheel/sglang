@@ -3223,6 +3223,7 @@ class Qwen2MoeAttention(nn.Module):
             fused_qkv is None
             and envs.SGLANG_WELMV4_MK_DECODE_KV_PROLOGUE.get()
             and in_target_native_capture()
+            and forward_batch.batch_size == 1
             and not self.is_nextn
             and forward_batch.forward_mode.is_decode_or_idle()
             and not forward_batch.is_extend_in_batch
