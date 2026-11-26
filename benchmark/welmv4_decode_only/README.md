@@ -58,6 +58,11 @@ layer for every supported Decode bucket (B1/B2/B4/B8). The setting is read
 when building the graphs. Leave it unset or set it to `0` to keep the
 original SDK packet policy. Prefill and the native backend are unchanged.
 
+Set `WELM_DP8_POSTMOE_FUSION=1` to combine the routed/shared expert add after
+DeepEP Combine and the invalid-row zeroing into one Triton kernel for B2/B4/B8.
+It is independent of Router fusion and off when unset or `0`. B1 keeps its
+existing fused kernel either way; Prefill and the native backend are unchanged.
+
 Use a compatible stock `deep_ep` package (`DEEPEP_PACKAGE_DIR`, containing
 `vendors/hwcomputing/op_api/lib`) and source the SHMEM install environment.
 Set `CANN_DIR` if it is not already selected, and `WELM_MODEL` to the model
@@ -70,7 +75,8 @@ The script defaults to fake transfer for isolated Decode testing; for real
 P/D deployment set `WELM_DECODE_TRANSFER_BACKEND` to match the Prefill peer.
 
 ```bash
-WELM_DP8_ROUTER_FUSION=1 bash run_dp8.sh megakernel-native > dp8-mk.log 2>&1
+WELM_DP8_ROUTER_FUSION=1 WELM_DP8_POSTMOE_FUSION=1 \
+    bash run_dp8.sh megakernel-native > dp8-mk.log 2>&1
 # After the service is ready, in a separate terminal:
 python3 smoke_dp8.py --serve-log dp8-mk.log | tee dp8-smoke.jsonl
 ```

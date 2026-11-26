@@ -5,7 +5,7 @@ import logging
 import os
 import shutil
 import tempfile
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import fields
 from pathlib import Path
 
@@ -16,7 +16,10 @@ from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.welm_router_fusion import router_capture_scope
-from sglang.srt.layers.welmv4_mk_triton import target_native_capture
+from sglang.srt.layers.welmv4_mk_triton import (
+    postmoe_capture_scope,
+    target_native_capture,
+)
 from sglang.srt.utils.nvtx_utils import profile_range
 
 logger = logging.getLogger(__name__)
@@ -95,6 +98,12 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
         self._fuse_router = router_fusion == "1"
         if self._fuse_router and not self._stock_dp8_decode:
             raise ValueError("WeLM Router fusion requires megakernel-native DP8")
+        postmoe_fusion = os.getenv("WELM_DP8_POSTMOE_FUSION", "0")
+        if postmoe_fusion not in ("0", "1"):
+            raise ValueError("WELM_DP8_POSTMOE_FUSION must be 0 or 1")
+        self._fuse_postmoe = postmoe_fusion == "1"
+        if self._fuse_postmoe and not self._stock_dp8_decode:
+            raise ValueError("WeLM PostMoE fusion requires megakernel-native DP8")
         self._native_router_sigmoid = envs.SGLANG_WELMV4_MK_DECODE_TOPK_MODE3.get()
         if self._native_router_sigmoid or envs.SGLANG_WELMV4_MK_DECODE_FLASH_KV_BOUND.get():
             if (
@@ -241,6 +250,10 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
                 f"got {local_requests}, {max(buckets)}, {capacity}"
             )
 
+    def _use_postmoe_fusion(self, bucket):
+        # Keep the original single-row fused kernel for B1, even when enabled.
+        return self._fuse_postmoe and bucket in _WELM_DIRECT_DECODE_BUCKETS[1:]
+
     def _decode_capture_options(self, bucket):
         single_row = bucket == 1
         if self._stock_dp8_decode:
@@ -325,11 +338,17 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
                 return forward_fn()
 
         capture_forward = forward_fn if ep_scope is None else capture_ep_forward
-        if self._fuse_router:
+        fuse_postmoe = self._use_postmoe_fusion(bucket)
+        if self._fuse_router or fuse_postmoe:
             unwrapped = capture_forward
 
             def capture_forward():
-                with router_capture_scope(bucket):
+                with (
+                    router_capture_scope(bucket)
+                    if self._fuse_router
+                    else nullcontext(),
+                    postmoe_capture_scope(bucket) if fuse_postmoe else nullcontext(),
+                ):
                     return unwrapped()
 
         def capture_outputs():

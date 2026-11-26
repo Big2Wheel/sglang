@@ -11,6 +11,11 @@ if [[ $router_fusion != 0 && ( $router_fusion != 1 || $mode != megakernel-native
     echo "WELM_DP8_ROUTER_FUSION must be 0 (off) or 1 with megakernel-native" >&2
     exit 2
 fi
+postmoe_fusion=${WELM_DP8_POSTMOE_FUSION-0}
+if [[ $postmoe_fusion != 0 && ( $postmoe_fusion != 1 || $mode != megakernel-native ) ]]; then
+    echo "WELM_DP8_POSTMOE_FUSION must be 0 (off) or 1 with megakernel-native" >&2
+    exit 2
+fi
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 sglang=$(cd "$here/../.." && pwd)
 python=${WELM_PYTHON:-python3}
@@ -38,6 +43,7 @@ args=(--model-path "$model" --served-model-name welmv4 --device npu
 if [[ $transfer == fake ]]; then args+=(--skip-tokenizer-init); fi
 if [[ $dry_run == --dry-run ]]; then
     if [[ $router_fusion == 1 ]]; then printf 'WELM_DP8_ROUTER_FUSION=1 '; fi
+    if [[ $postmoe_fusion == 1 ]]; then printf 'WELM_DP8_POSTMOE_FUSION=1 '; fi
     printf '%q ' "$python" -u -m sglang.launch_server "${args[@]}"
     printf '\n'
     exit 0

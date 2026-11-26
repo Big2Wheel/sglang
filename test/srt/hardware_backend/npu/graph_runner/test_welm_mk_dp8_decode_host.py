@@ -17,6 +17,7 @@ from unittest.mock import patch
 SRT = Path(__file__).resolve().parents[5] / "python/sglang/srt"
 BACKEND = SRT / "hardware_backend/npu/graph_runner/welm_mk_decode_backend.py"
 ROUTER = run_path(str(SRT / "layers/welm_router_fusion.py"))
+POSTMOE = run_path(str(SRT / "layers/welmv4_mk_triton.py"))
 
 
 class NativeBackendStub:
@@ -128,10 +129,12 @@ class TestWelmDP8StockDecode(unittest.TestCase):
             ),
         )
 
-    def create(self, *, direct_replay=True, router=None):
+    def create(self, *, direct_replay=True, router=None, postmoe=None):
         env = {"WELM_NPU_USE_FLASH_ATTN": "1"}
         if router is not None:
             env["WELM_DP8_ROUTER_FUSION"] = router
+        if postmoe is not None:
+            env["WELM_DP8_POSTMOE_FUSION"] = postmoe
         with patch.dict(os.environ, env, clear=True):
             backend = stock_backend(self.flags)(self.runner, direct_replay=direct_replay)
         self.addCleanup(backend._directory.cleanup)
@@ -147,6 +150,7 @@ class TestWelmDP8StockDecode(unittest.TestCase):
                         backend._decode_capture_options(bucket),
                         dict(welm_stock_decode_replay=True, welm_decode_batch_size=bucket),
                     )
+                    self.assertFalse(backend._use_postmoe_fusion(bucket))
 
     def test_one_switch_controls_router_fusion_for_every_dp8_bucket(self):
         for mode in ("0", "1"):
@@ -166,6 +170,44 @@ class TestWelmDP8StockDecode(unittest.TestCase):
         self.args.dp_size = 4
         with self.assertRaisesRegex(ValueError, "requires megakernel-native DP8"):
             self.create(router="1")
+
+    def test_postmoe_switch_preserves_b1_and_is_independent_of_router(self):
+        for postmoe in ("0", "1"):
+            for router in ("0", "1"):
+                backend = self.create(router=router, postmoe=postmoe)
+                for bucket in self.runner.capture_bs:
+                    with self.subTest(postmoe=postmoe, router=router, bucket=bucket):
+                        opts = backend._decode_capture_options(bucket)
+                        self.assertEqual(
+                            opts.get("welm_fuse_router", False), router == "1"
+                        )
+                        self.assertEqual(
+                            backend._use_postmoe_fusion(bucket),
+                            postmoe == "1" and bucket != 1,
+                        )
+
+    def test_postmoe_switch_requires_direct_dp8(self):
+        with self.assertRaisesRegex(ValueError, "must be 0 or 1"):
+            self.create(postmoe="unknown")
+        with self.assertRaisesRegex(ValueError, "requires megakernel-native DP8"):
+            self.create(direct_replay=False, postmoe="1")
+        self.args.dp_size = self.args.tp_size = 4
+        with self.assertRaisesRegex(ValueError, "requires megakernel-native DP8"):
+            self.create(postmoe="1")
+
+    def test_postmoe_capture_bucket_does_not_change_router_scope(self):
+        get_bucket = POSTMOE["postmoe_capture_bucket"]
+        capture_scope = POSTMOE["postmoe_capture_scope"]
+        get_router_bucket = ROUTER["router_capture_bucket"]
+        self.assertIsNone(get_bucket())
+        with ROUTER["router_capture_scope"](2):
+            with self.assertRaisesRegex(RuntimeError, "capture failed"):
+                with capture_scope(8):
+                    self.assertEqual(get_bucket(), 8)
+                    self.assertEqual(get_router_bucket(), 2)
+                    raise RuntimeError("capture failed")
+            self.assertIsNone(get_bucket())
+            self.assertEqual(get_router_bucket(), 2)
 
     def test_router_bucket_is_restored_after_capture_failure(self):
         get_bucket = ROUTER["router_capture_bucket"]

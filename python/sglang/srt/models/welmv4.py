@@ -1146,6 +1146,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         resolved_moe_ep_group=None,
         *,
         native_router_sigmoid: bool = False,
+        batched_postmerge_mask: bool = False,
     ) -> torch.Tensor:
         if allow_inplace_expert_shared_merge and return_components:
             raise RuntimeError(
@@ -1506,7 +1507,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             if fuse_postmerge_mask:
                 from sglang.srt.models.welmv4_post_moe import merge_and_mask
 
-                merge_and_mask(final_hidden_states, shared_output, invalid_row_mask)
+                merge_and_mask(
+                    final_hidden_states,
+                    shared_output,
+                    invalid_row_mask,
+                    batched=batched_postmerge_mask,
+                )
             elif allow_inplace_expert_shared_merge:
                 final_hidden_states.add_(shared_output)
             else:

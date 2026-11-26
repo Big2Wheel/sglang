@@ -6,6 +6,7 @@ from contextvars import ContextVar
 
 
 _TARGET_CAPTURE = ContextVar("welmv4_mk_target_capture", default=False)
+_POSTMOE_CAPTURE_BUCKET = ContextVar("welmv4_mk_postmoe_capture_bucket", default=None)
 
 
 def in_target_native_capture() -> bool:
@@ -19,6 +20,19 @@ def target_native_capture():
         yield
     finally:
         _TARGET_CAPTURE.reset(token)
+
+
+def postmoe_capture_bucket():
+    return _POSTMOE_CAPTURE_BUCKET.get()
+
+
+@contextmanager
+def postmoe_capture_scope(bucket):
+    token = _POSTMOE_CAPTURE_BUCKET.set(bucket)
+    try:
+        yield
+    finally:
+        _POSTMOE_CAPTURE_BUCKET.reset(token)
 
 
 class _CaptureKernel:

@@ -34,7 +34,10 @@ from sglang.srt.layers.dp_attention import (
     welm_reconstruct_attn_scattered_residual_rows,
 )
 from sglang.srt.layers.welm_router_fusion import router_capture_bucket
-from sglang.srt.layers.welmv4_mk_triton import in_target_native_capture
+from sglang.srt.layers.welmv4_mk_triton import (
+    in_target_native_capture,
+    postmoe_capture_bucket,
+)
 from sglang.srt.layers.welmv4_op import mmq_style_norm_after_attn
 from sglang.srt.state_capturer.routed_experts import local_dp_route_slot
 from sglang.srt.utils import get_bool_env_var
@@ -1703,16 +1706,30 @@ class WelmDpAttentionExecutor:
             state.hidden_states.masked_fill_(invalid_mask[:, None], 0)
             state.residual.masked_fill_(invalid_mask[:, None], 0)
 
-        fuse_postmerge_mask = (
+        postmerge_mask_eligible = (
             envs.SGLANG_WELMV4_MK_DECODE_FAST_PATH.get()
             and get_bool_env_var("WELM_NPU_USE_MK_TARGET_DECODE")
             and forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is None
             and state.hidden_states.device.type == "npu"
             and state.hidden_states.dtype == torch.bfloat16
-            and state.hidden_states.shape[0] == 1
             and layer.mlp.shared_expert is not None
         )
+        legacy_fuse_postmerge_mask = (
+            postmerge_mask_eligible and state.hidden_states.shape[0] == 1
+        )
+        postmoe_bucket = postmoe_capture_bucket()
+        if postmoe_bucket is not None and not (
+            postmerge_mask_eligible
+            and plan.role is WelmRunnerRole.TARGET_DP
+            and plan.outer_target_dp_size == plan.moe_ep_size == 8
+            and not forward_batch.is_extend_in_batch
+            and state.hidden_states.shape[0] == postmoe_bucket
+        ):
+            raise ValueError(
+                "WeLM DP8 PostMoE fusion requires the captured local Decode bucket"
+            )
+        fuse_postmerge_mask = legacy_fuse_postmerge_mask or postmoe_bucket is not None
 
         # AUTO already resolves this group-wide non-extend round to LL.
         # Retain legal, distinct TopK IDs for dummy rows and zero only their
@@ -1732,8 +1749,9 @@ class WelmDpAttentionExecutor:
         native_router_sigmoid = (
             router_bucket is not None
             or (
+                # Do not let the DP8 PostMoE switch change the Router path.
                 envs.SGLANG_WELMV4_MK_DECODE_TOPK_MODE3.get()
-                and fuse_postmerge_mask
+                and legacy_fuse_postmerge_mask
                 and plan.role is WelmRunnerRole.TARGET_DP
                 and not forward_batch.is_extend_in_batch
             )
@@ -1752,6 +1770,7 @@ class WelmDpAttentionExecutor:
             allow_inplace_expert_shared_merge=True,
             fuse_postmerge_mask=fuse_postmerge_mask,
             native_router_sigmoid=native_router_sigmoid,
+            batched_postmerge_mask=postmoe_bucket is not None,
         )
         state.hidden_states = self._store_final_components(layer, mlp_output)
         if not fuse_postmerge_mask:
