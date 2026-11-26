@@ -8,21 +8,29 @@ import time
 import urllib.request
 
 
-def run(url, seed, input_len, output_len):
+def run(
+    url, seed, input_len, output_len, *, dp_rank=0, bootstrap_room=None, rid=None,
+    ready=None, timeout=180,
+):
     ids = random.Random(seed).choices(range(100, 20000), k=input_len)
     payload = {
         "input_ids": ids, "stream": True, "bootstrap_host": "2.2.2.2",
-        "bootstrap_room": seed, "routed_dp_rank": 0,
+        "bootstrap_room": seed if bootstrap_room is None else bootstrap_room,
+        "routed_dp_rank": dp_rank,
         "sampling_params": {
             "temperature": 0, "max_new_tokens": output_len, "ignore_eos": True,
         },
     }
+    if rid is not None:
+        payload["rid"] = rid
     request = urllib.request.Request(url + "/generate", json.dumps(payload).encode(),
                                      {"Content-Type": "application/json"})
+    if ready is not None:
+        ready.wait(timeout)
     start = time.monotonic_ns()
     first = last = seen = prompt = None
     token_ids = []
-    with urllib.request.urlopen(request, timeout=180) as response:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
         for line in response:
             t = time.monotonic_ns()
             if not line.startswith(b"data:"):

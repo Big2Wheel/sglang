@@ -320,6 +320,17 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         else:
             output = self.backend.replay(graph_key, forward_batch)
 
+        # This override bypasses DecodeCudaGraphRunner.execute. The smoke test
+        # needs the same opt-in trace, after a replay actually succeeded.
+        if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
+            logger.info(
+                "Decode graph replay: worker=%s key_size=%s (bs) mode=%s raw_bs=%d",
+                "draft" if self.model_runner.is_draft_worker else "target",
+                graph_key.size,
+                forward_batch.forward_mode.name,
+                forward_batch.batch_size,
+            )
+
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
                 next_token_logits = None

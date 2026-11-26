@@ -15,10 +15,13 @@ from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
     NPUCudaGraphBackend,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.welm_router_fusion import router_capture_scope
 from sglang.srt.layers.welmv4_mk_triton import target_native_capture
 from sglang.srt.utils.nvtx_utils import profile_range
 
 logger = logging.getLogger(__name__)
+
+_WELM_DIRECT_DECODE_BUCKETS = (1, 2, 4, 8)
 
 
 class WelmMKDecodeBackend(NPUCudaGraphBackend):
@@ -74,7 +77,6 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
             raise ValueError(
                 "Model-level MegaKernel requires the complete local decoder stack"
             )
-        self._directory = tempfile.TemporaryDirectory(prefix="welm-mk-target-")
         # NpuGraphReadDone's flag handshake belongs to torch.npu.NPUGraph.
         # Keep the scheduler WAR barrier, with its whole-forward wait fallback.
         self.uses_fixed_decode_prologue = envs.SGLANG_WELMV4_MK_DECODE_FAST_PATH.get()
@@ -84,6 +86,15 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
             is_verify or not envs.SGLANG_WELMV4_DECODE_RS_AG.get()
         ):
             raise ValueError("Fixed WeLM MegaKernel Decode requires Decode RS/AG without MTP")
+        self._stock_dp8_decode = direct_replay and args.dp_size == 8
+        if self._stock_dp8_decode:
+            self._validate_stock_dp8_decode(runner)
+        router_fusion = os.getenv("WELM_DP8_ROUTER_FUSION", "0")
+        if router_fusion not in ("0", "1"):
+            raise ValueError("WELM_DP8_ROUTER_FUSION must be 0 or 1")
+        self._fuse_router = router_fusion == "1"
+        if self._fuse_router and not self._stock_dp8_decode:
+            raise ValueError("WeLM Router fusion requires megakernel-native DP8")
         self._native_router_sigmoid = envs.SGLANG_WELMV4_MK_DECODE_TOPK_MODE3.get()
         if self._native_router_sigmoid or envs.SGLANG_WELMV4_MK_DECODE_FLASH_KV_BOUND.get():
             if (
@@ -148,12 +159,103 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
             from sglang.srt.distributed.parallel_state import get_moe_ep_group
 
             self._ep_allgather_group = get_moe_ep_group().device_group
+        self._directory = tempfile.TemporaryDirectory(prefix="welm-mk-target-")
         runner.model_runner.welm_graph_read_done_enabled = False
         self._attn_backend = runner.attn_backend
         self._metadata = {}
         self._page_prologue_batches = {}
         self._replays = {}
         self._ineligible_shapes = set()
+
+    @staticmethod
+    def _validate_stock_dp8_decode(runner):
+        model_runner = runner.model_runner
+        args = model_runner.server_args
+        ps = model_runner.ps
+        if (
+            not args.enable_dp_attention
+            or not args.enable_dp_lm_head
+            or args.nnodes != 1
+            or (ps.tp_size, ps.attn_dp_size, ps.moe_ep_size) != (8, 8, 8)
+            or (ps.pp_size, ps.attn_tp_size, ps.attn_cp_size, ps.dcp_size)
+            != (1, 1, 1, 1)
+            or args.moe_dense_tp_size != 1
+        ):
+            raise ValueError(
+                "WeLM DP8 MegaKernel Decode requires single-node TP8/DP8/EP8, "
+                "DP attention and LM head, and PP/attention-TP/CP/DCP/dense-TP=1"
+            )
+        if (
+            args.moe_a2a_backend != "deepep"
+            or args.deepep_mode not in ("auto", "low_latency")
+            or args.enable_eplb
+            or args.ep_num_redundant_experts
+            or envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0
+            or not envs.SGLANG_DEEPEP_NORMAL_USE_ALLGATHER.get()
+            or envs.SGLANG_DEEPEP_NORMAL_USE_ALLTOALL.get()
+        ):
+            raise ValueError(
+                "WeLM DP8 MegaKernel Decode requires stock DeepEP LL Dispatch/Combine "
+                "(auto or low_latency) with the NORMAL AllGather group configured, "
+                "without expert rebalancing or replicas"
+            )
+        if envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get() or runner.disable_padding:
+            raise ValueError(
+                "WeLM DP8 MegaKernel Decode requires scheduler DP AllGather and "
+                "Decode graph padding for a common bucket on all ranks"
+            )
+        incompatible = (
+            "SGLANG_WELMV4_MK_EP_ALLGATHER",
+            "SGLANG_WELMV4_MK_DECODE_TOPK_MODE3",
+            "SGLANG_WELMV4_MK_DECODE_FLASH_KV_BOUND",
+            "SGLANG_WELMV4_MK_DECODE_FLASH_FULL_UNMASKED",
+            "SGLANG_WELMV4_MK_DECODE_PRE_MOE_MASK_NORM",
+            "SGLANG_WELMV4_MK_DECODE_KV_PROLOGUE",
+        )
+        enabled = [name for name in incompatible if getattr(envs, name).get()]
+        if enabled:
+            raise ValueError(
+                "WeLM DP8 MegaKernel Decode requires stock capture; disable "
+                + ", ".join(enabled)
+            )
+        if (
+            args.enable_two_batch_overlap
+            or args.enable_single_batch_overlap
+            or args.enable_lora
+        ):
+            raise ValueError(
+                "WeLM DP8 MegaKernel Decode requires ordinary fixed Decode buckets "
+                "without TBO/SBO or LoRA"
+            )
+        buckets = runner.capture_bs
+        if not buckets or any(bs not in _WELM_DIRECT_DECODE_BUCKETS for bs in buckets):
+            raise ValueError(
+                "WeLM DP8 MegaKernel Decode capture buckets must come from 1, 2, 4, 8"
+            )
+        capacity = model_runner.welm_decode_ll_dispatch_capacity
+        local_requests = model_runner.max_running_requests
+        if capacity is None or not 0 < local_requests <= max(buckets) <= capacity:
+            raise ValueError(
+                "WeLM DP8 MegaKernel Decode requires effective per-rank max running "
+                "requests <= largest captured bucket <= DeepEP LL per-rank capacity; "
+                f"got {local_requests}, {max(buckets)}, {capacity}"
+            )
+
+    def _decode_capture_options(self, bucket):
+        single_row = bucket == 1
+        if self._stock_dp8_decode:
+            # Start with the stock SDK policy on every DP8 bucket, without the
+            # DP4 single-row capture substitutions.
+            options = dict(welm_stock_decode_replay=True, welm_decode_batch_size=bucket)
+            if self._fuse_router:
+                options["welm_fuse_router"] = True
+            return options
+        options = {}
+        if single_row and self._mask_norm_layers:
+            options["welm_mask_norm_layers"] = self._mask_norm_layers
+        if self.uses_fixed_decode_prologue and not single_row:
+            options["welm_decode_batch_size"] = bucket
+        return options
 
     @contextmanager
     def capture_session(self, stream):
@@ -206,17 +308,13 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
         bucket = shape_key.size
         single_row = bucket == 1
         if self.uses_fixed_decode_prologue and not single_row and (
-            not self._direct_replay or bucket not in (2, 4, 8)
+            not self._direct_replay or bucket not in _WELM_DIRECT_DECODE_BUCKETS
         ):
             raise ValueError(
                 "Multi-row WeLM MegaKernel Decode requires direct replay "
                 "and a capture bucket of 2, 4, or 8"
             )
-        scope_options = {}
-        if single_row and self._mask_norm_layers:
-            scope_options["welm_mask_norm_layers"] = self._mask_norm_layers
-        if self.uses_fixed_decode_prologue and not single_row:
-            scope_options["welm_decode_batch_size"] = bucket
+        scope_options = self._decode_capture_options(bucket)
         # The runner owns and initializes the fixed inputs, attention metadata,
         # scratch KV slots, and DeepEP mode. Capture is entered in the same
         # order on all ranks, including those without local decode requests.
@@ -227,6 +325,12 @@ class WelmMKDecodeBackend(NPUCudaGraphBackend):
                 return forward_fn()
 
         capture_forward = forward_fn if ep_scope is None else capture_ep_forward
+        if self._fuse_router:
+            unwrapped = capture_forward
+
+            def capture_forward():
+                with router_capture_scope(bucket):
+                    return unwrapped()
 
         def capture_outputs():
             output = capture_forward()

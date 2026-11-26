@@ -33,6 +33,7 @@ from sglang.srt.layers.dp_attention import (
     welm_dp_segmented_valid_mask,
     welm_reconstruct_attn_scattered_residual_rows,
 )
+from sglang.srt.layers.welm_router_fusion import router_capture_bucket
 from sglang.srt.layers.welmv4_mk_triton import in_target_native_capture
 from sglang.srt.layers.welmv4_op import mmq_style_norm_after_attn
 from sglang.srt.state_capturer.routed_experts import local_dp_route_slot
@@ -1716,11 +1717,26 @@ class WelmDpAttentionExecutor:
         # AUTO already resolves this group-wide non-extend round to LL.
         # Retain legal, distinct TopK IDs for dummy rows and zero only their
         # weights; NORMAL's -1 sentinel is not part of the LL contract.
-        native_router_sigmoid = (
-            envs.SGLANG_WELMV4_MK_DECODE_TOPK_MODE3.get()
-            and fuse_postmerge_mask
-            and plan.role is WelmRunnerRole.TARGET_DP
+        router_bucket = router_capture_bucket()
+        if router_bucket is not None and not (
+            plan.role is WelmRunnerRole.TARGET_DP
+            and plan.outer_target_dp_size == plan.moe_ep_size == 8
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and forward_batch.spec_info is None
             and not forward_batch.is_extend_in_batch
+            and state.hidden_states.device.type == "npu"
+            and state.hidden_states.dtype == torch.bfloat16
+            and state.hidden_states.shape[0] == router_bucket
+        ):
+            raise ValueError("WeLM DP8 Router requires the captured local Decode bucket")
+        native_router_sigmoid = (
+            router_bucket is not None
+            or (
+                envs.SGLANG_WELMV4_MK_DECODE_TOPK_MODE3.get()
+                and fuse_postmerge_mask
+                and plan.role is WelmRunnerRole.TARGET_DP
+                and not forward_batch.is_extend_in_batch
+            )
         )
         mlp_output = layer.mlp(
             state.hidden_states,

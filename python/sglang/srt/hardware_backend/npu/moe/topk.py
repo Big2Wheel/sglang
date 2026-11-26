@@ -10,6 +10,7 @@ from sglang.srt.layers.moe.topk import (
     capture_routed_experts_if_allowed,
     select_experts,
 )
+from sglang.srt.layers.welm_router_fusion import router_capture_bucket
 from sglang.srt.utils import get_bool_env_var
 
 _USE_SIGMOID_NO_RENORM_OUTPUT = get_bool_env_var(
@@ -68,17 +69,21 @@ def fused_expert_bias_topk_npu(
             "expert_bias must be 1D and match the expert dimension, "
             f"got {tuple(expert_bias.shape)} for logits {tuple(router_logits.shape)}"
         )
-    if native_router_sigmoid and (
-        scoring_func != "sigmoid"
-        or renormalize
-        or top_k != _WELM_FIXED_TOPK
-        or router_logits.shape != _WELM_FIXED_ROUTER_SHAPE
-        or router_logits.dtype != torch.float32
-        or expert_bias.dtype != torch.float32
-        or router_logits.device.type != "npu"
-        or router_logits.device != expert_bias.device
-    ):
-        raise ValueError("Native WeLM sigmoid TopK requires fixed FP32 routing without renorm")
+    if native_router_sigmoid:
+        rows = router_capture_bucket() or _WELM_FIXED_ROUTER_SHAPE[0]
+        if (
+            scoring_func != "sigmoid"
+            or renormalize
+            or top_k != _WELM_FIXED_TOPK
+            or router_logits.shape != (rows, _WELM_FIXED_ROUTER_SHAPE[1])
+            or router_logits.dtype != torch.float32
+            or expert_bias.dtype != torch.float32
+            or router_logits.device.type != "npu"
+            or router_logits.device != expert_bias.device
+        ):
+            raise ValueError(
+                "Native WeLM sigmoid TopK requires fixed FP32 routing without renorm"
+            )
 
     # MoeGatingTopK requires x and bias to have the same dtype. WeLM's router
     # and expert bias are FP32, so the casts are normally no-ops.
